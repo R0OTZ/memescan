@@ -1,0 +1,35 @@
+name: scan
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 min (GitHub may run it late when busy)
+  workflow_dispatch: {}      # "Run workflow" button for a manual scan
+concurrency:
+  group: scan
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore bot memory
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+      - name: Scan
+        run: python3 scanner.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WALLET: ${{ secrets.WALLET }}
+          STAKE_USD: "2"
+      - name: Save bot memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
