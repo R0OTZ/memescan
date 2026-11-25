@@ -22,6 +22,7 @@ import urllib.request
 
 STATE_PATH = os.environ.get("STATE_PATH", "state/state_v2.json")
 SOL_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+RPCS = [SOL_RPC, "https://solana-rpc.publicnode.com"]  # free public endpoints, tried in order
 DS = "https://api.dexscreener.com"
 GT = "https://api.geckoterminal.com/api/v2"
 RC = "https://api.rugcheck.xyz/v1"
@@ -242,9 +243,8 @@ def wallet_tokens(owner):
     """Returns {mint: amount} or None if the RPC failed (never confuse failure with 'sold everything')."""
     res, failed = {}, 0
     for prog in TOKEN_PROGRAMS:
-        r = get_json(SOL_RPC, "POST", {"jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
-                                       "params": [owner, {"programId": prog}, {"encoding": "jsonParsed"}]})
-        val = ((r or {}).get("result") or {}).get("value") if isinstance(r, dict) else None
+        r = rpc("getTokenAccountsByOwner", [owner, {"programId": prog}, {"encoding": "jsonParsed"}])
+        val = r.get("value") if isinstance(r, dict) else None
         if val is None:
             failed += 1
             continue
@@ -263,9 +263,12 @@ def wallet_tokens(owner):
 
 
 def rpc(method, params):
-    r = get_json(SOL_RPC, "POST", {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-    time.sleep(0.15)  # public RPC is rate-limited
-    return (r or {}).get("result") if isinstance(r, dict) else None
+    for url in RPCS:  # free RPCs rate-limit GitHub's shared IPs; fall through to the next one
+        r = get_json(url, "POST", {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+        time.sleep(0.15)
+        if isinstance(r, dict) and "result" in r:
+            return r["result"]
+    return None
 
 
 def sol_usd():
