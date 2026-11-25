@@ -1,17 +1,18 @@
 name: scan
 on:
   schedule:
-    - cron: "3-59/10 * * * *"   # every 10 min, off the busy :00 mark (GitHub may still run it late)
-  workflow_dispatch: {}      # "Run workflow" button for a manual scan
+    - cron: "3-59/10 * * * *"   # backup starter in case the loop chain ever breaks
+  workflow_dispatch: {}
 concurrency:
   group: scan
   cancel-in-progress: false
 permissions:
   contents: read
+  actions: write   # lets each run start the next one
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
       - name: Restore bot memory
@@ -20,8 +21,13 @@ jobs:
           path: state
           key: state-${{ github.run_id }}
           restore-keys: state-
-      - name: Scan
-        run: python3 scanner.py
+      - name: Scan every ~2 minutes for 55 minutes
+        run: |
+          end=$((SECONDS + 55*60))
+          while [ $SECONDS -lt $end ]; do
+            python3 scanner.py || echo "scan failed, retrying next cycle"
+            sleep 60
+          done
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -33,3 +39,8 @@ jobs:
         with:
           path: state
           key: state-${{ github.run_id }}
+      - name: Start the next hour
+        if: ${{ !cancelled() }}
+        run: gh workflow run scan.yml --repo "$GITHUB_REPOSITORY" --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}
