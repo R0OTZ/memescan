@@ -42,7 +42,7 @@ CFG = dict(
     tp_mult=2.0,
     trail_from_peak=-25.0,   # after take-profit, sell if price falls 25% from peak
     dev_sell_drop=0.20,      # creator balance down 20%+ = dev selling
-    max_rugchecks=20,        # per run, to stay polite to the free API
+    max_rugchecks=30,        # per run, to stay polite to the free API
     realert_hours=3,
     watch_hours=6,
 )
@@ -59,6 +59,8 @@ USD_STABLES = ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfr
                "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY2QdWX2ZCG7FrPKdDhUmJ")
 WSOL = "So11111111111111111111111111111111111111112"
 ATA_RENT_SOL = 0.00203928  # refundable rent when a token account is created; not part of your cost
+BAL = {}  # stablecoin balance found in your wallet this run
+_SOLP = []
 
 
 def log(msg):
@@ -128,7 +130,7 @@ def discover():
     seen, order = {}, []
 
     def add(mint, tag):
-        if not mint or not isinstance(mint, str):
+        if not mint or not isinstance(mint, str) or mint in STABLES:
             return
         if mint not in seen:
             seen[mint] = []
@@ -146,6 +148,18 @@ def discover():
         bid = (((p.get("relationships") or {}).get("base_token") or {}).get("data") or {}).get("id", "")
         if bid.startswith("solana_"):
             add(bid[len("solana_"):], "gecko trending")
+    # graduated = pump.fun coins that filled their bonding curve and moved to PumpSwap
+    for url, tag in ((GT + "/networks/solana/new_pools?include=dex&page=1", "just graduated"),
+                     (GT + "/networks/solana/new_pools?include=dex&page=2", "just graduated"),
+                     (GT + "/networks/solana/dexes/pumpswap/pools?sort=h24_volume_usd_desc&page=1", "graduated")):
+        for p in as_list(get_json(url)):
+            rel = p.get("relationships") or {}
+            dex = ((rel.get("dex") or {}).get("data") or {}).get("id", "")
+            if "new_pools" in url and dex != "pumpswap":
+                continue
+            bid = ((rel.get("base_token") or {}).get("data") or {}).get("id", "")
+            if bid.startswith("solana_"):
+                add(bid[len("solana_"):], tag)
     return order, seen
 
 
@@ -240,6 +254,8 @@ def wallet_tokens(owner):
                 amt = float(info["tokenAmount"].get("uiAmount") or 0)
             except (KeyError, TypeError, ValueError):
                 continue
+            if info["mint"] in USD_STABLES:
+                BAL["usd"] = BAL.get("usd", 0) + amt
             if amt > 0 and info["mint"] not in STABLES:
                 res[info["mint"]] = res.get(info["mint"], 0) + amt
                 ACCTS.setdefault(info["mint"], []).append(a.get("pubkey"))
@@ -253,8 +269,23 @@ def rpc(method, params):
 
 
 def sol_usd():
-    p = pairs_for([WSOL]).get(WSOL)
-    return float(p.get("priceUsd") or 0) if p else 0.0
+    if not _SOLP:
+        p = pairs_for([WSOL]).get(WSOL)
+        _SOLP.append(float(p.get("priceUsd") or 0) if p else 0.0)
+    return _SOLP[0]
+
+
+def buying_power(owner):
+    """USD you can spend: stablecoins + SOL (keeping ~0.01 SOL for fees). None if unknown."""
+    if not owner:
+        return None
+    r = rpc("getBalance", [owner])
+    if not isinstance(r, dict):
+        return None
+    sol = (r.get("value") or 0) / 1e9
+    sp = sol_usd()
+    stable = BAL.get("usd", 0.0)
+    return dict(usd=stable + max(0.0, sol - 0.01) * sp, stable=stable, sol=sol, sol_usd=sol * sp)
 
 
 def entry_from_chain(owner, mint, sol_price):
@@ -398,6 +429,10 @@ def card(mint, m, rk, j, tags):
                      f"Stop {CFG['stop_pct']:.0f}% ({px(stop)}).")
     if j.get("odds"):
         lines.append(j["odds"])
+    if j.get("power"):
+        lines.append(j["power"])
+    if any("graduated" in t for t in tags):
+        lines.append("Graduated: finished its pump.fun curve and now trades on PumpSwap.")
     if j.get("target"):
         lines.append(f"Entry: wait for {px(j['target'])}. I'll ping you if it gets there and still looks safe.")
     if "boosted" in tags:
@@ -557,6 +592,7 @@ def check_positions(state, held, pairs, rugs, owner=""):
 
 # ---------------------------------------------------------------- main
 def run():
+    BAL.clear(); ACCTS.clear(); _SOLP.clear()
     state = load_state()
     cmds = read_commands(state)
     if not (os.environ.get("TELEGRAM_CHAT_ID") or state.get("chat_id")):
@@ -578,12 +614,14 @@ def run():
     update_calls(state, {k: metrics(v)["price"] for k, v in pairs.items()})
 
     # gate cheaply on market data, then rug-check the best few
-    judged, rugs, pending = [], {}, []
+    judged, rugs, pending, live = [], {}, [], []
     for mint in order:
         if mint not in pairs:
             continue
         m = metrics(pairs[mint])
         gate, why = market_gate(m)
+        if m["price"] > 0 and m["liq"] >= CFG["min_liq"] and m["b1"] + m["s1"] >= CFG["min_h1_txns"]:
+            live.append((mint, m))
         if gate == "skip":
             continue
         if gate in ("AVOID", "WAIT"):
@@ -608,6 +646,16 @@ def run():
     if held_ok:
         msgs += check_positions(state, held, pairs, rugs, wallet)
     holding = any(p.get("value", 0) >= 1 for p in state["positions"].values())
+    bp = buying_power(wallet) if held_ok else None
+    stake = CFG["stake_usd"]
+    can_buy = (bp["usd"] >= stake) if bp else not holding
+
+    def power_line():
+        if not bp:
+            return ""
+        n = int(bp["usd"] // stake)
+        return (f"Buying power {usd(bp['usd'])}: enough for {n} buy(s) at {usd(stake)}" if n else
+                f"Buying power {usd(bp['usd'])}: below the {usd(stake)} minimum")
 
     buys = []  # (rank, mint, m, rk, j): your stake covers ONE position, so only the best gets a card
     # dip watch -> BUY when target reached and still safe
@@ -621,7 +669,7 @@ def run():
             if not rk["ok"]:
                 state["watch"].pop(mint)
                 continue
-            if m["price"] <= w["target"] and not holding:
+            if m["price"] <= w["target"] and can_buy:
                 tot = m["b1"] + m["s1"]
                 sc = momentum_score(m, rk)[0]
                 if tot and m["b1"] / tot >= 0.45 and sc >= 50:
@@ -634,7 +682,7 @@ def run():
         if recent(mint):
             continue
         if j["verdict"] == "BUY":
-            if not holding:
+            if can_buy:
                 buys.append((j["score"], mint, m, rk, j))
         elif j["verdict"] == "WAIT" and j.get("target") and mint not in state["watch"]:
             state["watch"][mint] = dict(target=j["target"], set=NOW, sym=m["symbol"])
@@ -650,6 +698,7 @@ def run():
         state["alerted"][mint] = NOW
         if i == 0:
             j["odds"] = odds_line(state, j["score"])
+            j["power"] = power_line()
             others = ", ".join("$" + html.escape(b[2]["symbol"]) for b in buys[1:4])
             msgs.append(card(mint, m, rk, j, tags.get(mint, [])) +
                         (f"\nAlso qualifying (weaker): {others}" if others else ""))
@@ -657,15 +706,58 @@ def run():
     state["last_judged"] = [dict(mint=mi, sym=m["symbol"], verdict=j["verdict"], score=j["score"],
                                  why="; ".join(j["reasons"])[:90], price=m["price"])
                             for mi, m, rk, j in judged][:15]
+    verdicts = {mi: j for mi, m, rk, j in judged}
+    icon = {"BUY": "🟢", "WAIT": "🟡", "AVOID": "🔴"}
+
+    def row(mi, m, extra=""):
+        j = verdicts.get(mi)
+        tag = f"{icon[j['verdict']]} {j['verdict']}" if j else "⚪ not checked"
+        return (f"{tag} <b>${html.escape(m['symbol'])}</b> {px(m['price'])} · 1h {m['ch_h1']:+.0f}% · "
+                f"MC {usd(m['mcap'])}{extra}")
+
+    if not state.get("menu_set"):
+        tg("setMyCommands", commands=[dict(command=c, description=d) for c, d in (
+            ("buy", "What passes the checks and you can afford now"), ("trending", "Trending coins with verdicts"),
+            ("gainers", "Biggest 1h movers (live, liquid)"), ("graduated", "Coins that just left pump.fun"),
+            ("balance", "Your buying power and positions"), ("positions", "Your open coins vs entry"),
+            ("stats", "How the bot's calls have done"))])
+        state["menu_set"] = True
 
     for c in dict.fromkeys(cmds):
-        if c in ("/scan", "/start", "/help"):
+        if c == "/buy":
+            bl = [(mi, m) for mi, m, rk, j in judged if j["verdict"] == "BUY"]
+            body = "\n".join(row(mi, m, f" · score {verdicts[mi]['score']}") for mi, m in bl) or \
+                "Nothing passes the rug checks with buying momentum right now."
+            pl = power_line()
+            msgs.append(f"<b>Passing checks now</b>\n{body}" + (f"\n\n{pl}" if pl else "") +
+                        "\nUnproven signals: see /stats before trusting them.")
+        elif c == "/gainers":
+            top = sorted(live, key=lambda x: -x[1]["ch_h1"])[:10]
+            msgs.append("<b>Top 1h gainers</b> (liquid, active)\n" +
+                        ("\n".join(row(mi, m) for mi, m in top) or "None right now.") +
+                        "\nBig gainers are often the riskiest entries: check the verdict.")
+        elif c == "/graduated":
+            gl = [(mi, m) for mi, m in ((mi, metrics(pairs[mi])) for mi in order if mi in pairs)
+                  if any("graduated" in t for t in tags.get(mi, []))]
+            gl.sort(key=lambda x: (x[1]["age_min"] if x[1]["age_min"] is not None else 1e9))
+            msgs.append("<b>Graduated to PumpSwap</b> (newest first)\n" + ("\n".join(
+                row(mi, m, f" · age {m['age_min'] / 60:.1f}h" if m["age_min"] is not None else "")
+                for mi, m in gl[:10]) or "None found this run."))
+        elif c == "/balance":
+            if not bp:
+                msgs.append("Couldn't read your wallet balance this run (free RPC hiccup). Try again.")
+            else:
+                posv = sum(p.get("value", 0) for p in state["positions"].values())
+                msgs.append(f"<b>Balance</b>\nStablecoins {usd(bp['stable'])} · SOL {bp['sol']:.4f} "
+                            f"({usd(bp['sol_usd'])})\nIn coins: {usd(posv)} across {len(state['positions'])} "
+                            f"position(s)\n{power_line()}")
+        elif c in ("/scan", "/trending", "/start", "/help"):
             rows = sorted(state["last_judged"], key=lambda r: ({"BUY": 0, "WAIT": 1, "AVOID": 2}[r["verdict"]], -r["score"]))
-            icon = {"BUY": "🟢", "WAIT": "🟡", "AVOID": "🔴"}
             body = "\n".join(f"{icon[r['verdict']]} <b>${html.escape(r['sym'])}</b> {r['verdict']} {r['score']} · "
                              f"{html.escape(r['why'])}" for r in rows) or "Nothing passed the market filters this run."
-            note = "\n\n(Holding a position: BUY alerts paused, your stake is in use.)" if holding else ""
-            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /scan /positions /stats")
+            note = "" if can_buy else f"\n\n(BUY alerts paused: buying power under {usd(stake)}.)"
+            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /buy /trending /gainers /graduated "
+                        f"/balance /positions /stats")
         elif c == "/positions":
             if not state["positions"]:
                 msgs.append("No open positions seen in your wallet.")
