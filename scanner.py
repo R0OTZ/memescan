@@ -49,6 +49,7 @@ CFG = dict(
     trail_from_peak=-25.0,   # after take-profit, sell if price falls 25% from peak
     dev_sell_drop=0.20,      # creator balance down 20%+ = dev selling
     max_rugchecks=30,        # per run, to stay polite to the free API
+    best_alert_score=70,     # ping when a coin at or above this score takes #1 on /best
     realert_hours=3,
     watch_hours=6,
 )
@@ -183,7 +184,8 @@ def discover():
                 return 0.0
 
         FOMO_META[al["tokenAddress"]] = dict(
-            vol1=num("volume1"), ch1=num("change1") * 100, holders=md.get("holders"),
+            vol1=num("volume1"), vol5=num("volume5m"), ch1=num("change1") * 100, ch5=num("change5m") * 100,
+            ch4=num("change4") * 100, txn1=num("txnCount1"), holders=md.get("holders"),
             x=(((md.get("token") or {}).get("socialLinks") or {}).get("twitter")))
     for i, mint in enumerate(sorted(FOMO_META, key=lambda k: -FOMO_META[k]["vol1"])):
         add(mint, "fomo hot" if i < 15 and FOMO_META[mint]["vol1"] > 0 else "fomo")
@@ -476,6 +478,78 @@ def judge(m, rk):
     return dict(verdict="WAIT", score=score, reasons=["no clear momentum yet"])
 
 
+def fomo_rank(state, pairs, rug_for, limit=10):
+    """Rank fomo-listed Solana coins on public stats. Returns [(score, mint, m, rk, parts)] best first.
+
+    Score 0-100 = buyer flow (25) + activity (20) + acceleration (20) + trend (15) + holder growth (20),
+    minus rug-check warnings. Coins failing the rug check, too thin, too new or dead are left out."""
+    hist = state.setdefault("fomo_hist", {})
+    for mint, fm in FOMO_META.items():  # holder history, sampled every ~5 min, kept 2h
+        h = [x for x in hist.get(mint, []) if NOW - x[0] < 7200]
+        if fm.get("holders") and (not h or NOW - h[-1][0] >= 300):
+            h.append([NOW, fm["holders"]])
+        hist[mint] = h
+    for mint in [k for k in hist if k not in FOMO_META]:
+        hist.pop(mint)
+
+    def growth(mint):
+        h, now_h = hist.get(mint, []), (FOMO_META[mint].get("holders") or 0)
+        old = [x for x in h if NOW - x[0] >= 900]  # need 15+ min of history
+        if not old or not old[0][1] or not now_h:
+            return None
+        then = min(old, key=lambda x: abs((NOW - x[0]) - 3600))
+        return (now_h - then[1]) / then[1] / ((NOW - then[0]) / 3600)  # per hour
+
+    pre = []
+    for mint, fm in FOMO_META.items():
+        p = pairs.get(mint)
+        if not p:
+            continue
+        m = metrics(p)
+        if (m["liq"] < CFG["min_liq"] or not (CFG["min_mcap"] <= (m["mcap"] or 0) <= 500_000_000)
+                or m["b1"] + m["s1"] < CFG["min_h1_txns"]
+                or (m["age_min"] is not None and m["age_min"] < CFG["min_age_min"])):
+            continue
+        tot = m["b1"] + m["s1"]
+        br = m["b1"] / tot if tot else 0.5
+        turn = m["vol_h1"] / m["liq"] if m["liq"] else 0
+        accel = fm["vol5"] * 12 / fm["vol1"] if fm["vol1"] > 0 else 0
+        ch1 = m["ch_h1"]
+        g = growth(mint)
+        parts = dict(
+            flow=max(0.0, min(1.0, (br - 0.45) / 0.25)) * 25,
+            activity=min(turn / 2, 1.0) * 20,
+            accel=max(0.0, min(1.0, (accel - 0.5) / 1.5)) * 20,
+            trend=(15 if 0 < ch1 <= 60 else 7 if 60 < ch1 <= 120 else 0) * (0 if m["ch_m5"] < -5 else 1),
+            holders=max(0.0, min(1.0, g / 0.05)) * 20 if g is not None else 0.0)
+        info = dict(br=br, turn=turn, accel=accel, g=g)
+        pre.append([sum(parts.values()), mint, m, parts, info])
+    pre.sort(key=lambda x: -x[0])
+    out = []
+    for s, mint, m, parts, info in pre[:limit * 2]:
+        rk = rug_for(mint)
+        if not rk or not rk["ok"]:
+            continue
+        pen = 4 * len(rk["warns"]) + max(0.0, rk["score_norm"] - 30) * 0.3
+        out.append((max(0, round(s - pen)), mint, m, rk, dict(parts, **info, pen=pen)))
+        if len(out) >= limit:
+            break
+    out.sort(key=lambda x: -x[0])
+    return out
+
+
+def best_why(m, d):
+    bits = [f"{d['br']:.0%} buys", f"vol {d['turn']:.1f}x liq/h"]
+    if d["accel"] >= 1.2:
+        bits.append(f"speeding up {d['accel']:.1f}x")
+    elif d["accel"] < 0.7:
+        bits.append("cooling off")
+    if d["g"] is not None:
+        bits.append(f"holders {d['g'] * 100:+.1f}%/h")
+    bits.append(f"1h {m['ch_h1']:+.0f}%")
+    return " · ".join(bits)
+
+
 # ---------------------------------------------------------------- formatting
 def usd(x):
     if x >= 1e6:
@@ -612,7 +686,7 @@ def stats_text(state):
     if not calls:
         return "No calls logged yet."
     out = [f"<b>Call log</b> ({len(calls)} calls since {time.strftime('%b %d', time.gmtime(calls[0]['ts']))})"]
-    for v in ("BUY", "COPY", "WAIT", "AVOID"):
+    for v in ("BEST", "BUY", "COPY", "WAIT", "AVOID"):
         cs = [c for c in calls if c["verdict"] == v]
         if not cs:
             continue
@@ -851,6 +925,16 @@ def run():
                 record_call(state, mint, m, dict(j, verdict="COPY"))
             msgs.append(f"👥 <b>{html.escape(name)} BOUGHT ${sym}</b> (~{usd(size)})\n" + card(mint, m, rk, j, tags.get(mint, [])))
         state["copy_log"] = log_[-30:]
+    best = fomo_rank(state, pairs, lambda mi: rugs.get(mi) or cached_rug(mi))
+    if best:
+        s, mint, m, rk, d = best[0]
+        last = state.get("best_alert") or {}
+        if s >= CFG["best_alert_score"] and (last.get("mint") != mint or NOW - last.get("ts", 0) > 3600):
+            state["best_alert"] = dict(mint=mint, ts=NOW)
+            j = dict(verdict="BUY", score=s, reasons=["#1 on fomo by public stats: " + best_why(m, d)],
+                     odds=odds_line(state, s), power=power_line())
+            msgs.append("🏆 <b>New #1 on fomo</b>\n" + card(mint, m, rk, j, tags.get(mint, [])))
+            record_call(state, mint, m, dict(j, verdict="BEST"))
     state["alerted"] = {k: v for k, v in state["alerted"].items() if NOW - v < 86400}
     state["last_judged"] = [dict(mint=mi, sym=m["symbol"], verdict=j["verdict"], score=j["score"],
                                  why="; ".join(j["reasons"])[:90], price=m["price"])
@@ -864,19 +948,32 @@ def run():
         return (f"{tag} <b>${html.escape(m['symbol'])}</b> {px(m['price'])} · 1h {m['ch_h1']:+.0f}% · "
                 f"MC {usd(m['mcap'])}{extra}")
 
-    if state.get("menu_set") != 3:  # (re)send the command menu when it changes
+    if state.get("menu_set") != 4:  # (re)send the command menu when it changes
         tg("setMyCommands", commands=[dict(command=c, description=d) for c, d in (
+            ("best", "Best on fomo right now, ranked on public stats"),
             ("buy", "What passes the checks and you can afford now"), ("fomo", "fomo's hottest coins right now"),
             ("copy", "What the traders you follow just did"),
             ("trending", "Trending coins with verdicts"),
             ("gainers", "Biggest 1h movers (live, liquid)"), ("graduated", "Coins that just left pump.fun"),
             ("balance", "Your buying power and positions"), ("positions", "Your open coins vs entry"),
             ("stats", "How the bot's calls have done"))])
-        state["menu_set"] = 3
+        state["menu_set"] = 4
 
     def answer(c):
         msgs = []
-        if c == "/copy":
+        if c == "/best":
+            if not best:
+                msgs.append("Nothing on fomo's list passes the rug check and filters right now.")
+            else:
+                rows_ = [f"{i + 1}. <b>${html.escape(m['symbol'])}</b> {s}/100 · {px(m['price'])} · MC {usd(m['mcap'])}\n"
+                         f"    {html.escape(best_why(m, d))}" for i, (s, mi, m, rk, d) in enumerate(best[:5])]
+                warm = "" if any(d["g"] is not None for *_, d in best) else \
+                    "\n(Holder growth kicks in after ~15 min of history.)"
+                top = best[0][1]
+                msgs.append("🏆 <b>Best on fomo right now</b> (public stats, rug-checked)\n" + "\n".join(rows_) +
+                            f"\n\n#1 address: <code>{html.escape(top)}</code>{warm}\n"
+                            "Ranked by rules, not a promise. /stats grades the #1 picks (BEST).")
+        elif c == "/copy":
             if not COPY:
                 msgs.append("No traders set up yet. Their wallet addresses go in COPY_WALLETS in the workflow.")
             else:
@@ -922,7 +1019,7 @@ def run():
             body = "\n".join(f"{icon[r['verdict']]} <b>${html.escape(r['sym'])}</b> {r['verdict']} {r['score']} · "
                              f"{html.escape(r['why'])}" for r in rows) or "Nothing passed the market filters this run."
             note = "" if can_buy else f"\n\n(BUY alerts paused: buying power under {usd(stake)}.)"
-            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /buy /fomo /copy /trending /gainers /graduated "
+            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /best /buy /fomo /copy /trending /gainers /graduated "
                         f"/balance /positions /stats")
         elif c == "/positions":
             if not state["positions"]:
@@ -937,7 +1034,7 @@ def run():
             msgs.append(stats_text(state))
         return msgs
 
-    snapshot = {c: answer(c) for c in ("/buy", "/fomo", "/copy", "/gainers", "/graduated", "/balance",
+    snapshot = {c: answer(c) for c in ("/best", "/buy", "/fomo", "/copy", "/gainers", "/graduated", "/balance",
                                        "/trending", "/positions", "/stats")}
     try:
         tmp = os.path.join(STATE_DIR, "snapshot.json.tmp")
