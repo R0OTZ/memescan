@@ -344,14 +344,21 @@ def wallet_tokens(owner):
 
 
 RPC_ERRS = {}
+RPC_FAILS = {}  # url -> failures this run; a server that fails twice is skipped for the rest of the run
 
 
 def rpc(method, params):
     for url in RPCS:  # free RPCs rate-limit GitHub's shared IPs; fall through to the next one
-        r = get_json(url, "POST", {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+        if RPC_FAILS.get(url, 0) >= 2:
+            continue
+        r = get_json(url, "POST", {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                     timeout=8, tries=1)
         time.sleep(0.4 if method == "getTransaction" else 0.15)
         if isinstance(r, dict) and "result" in r:
+            RPC_FAILS[url] = 0
             return r["result"]
+        if not isinstance(r, dict):  # timeout / HTTP error: count toward skipping this server
+            RPC_FAILS[url] = RPC_FAILS.get(url, 0) + 1
         key = (method, url.split("//")[-1][:30])
         if RPC_ERRS.get(key, 0) < 2:  # log the first couple of failures per endpoint, so problems are visible
             RPC_ERRS[key] = RPC_ERRS.get(key, 0) + 1
@@ -918,7 +925,7 @@ def check_positions(state, held, pairs, rugs, owner=""):
 
 # ---------------------------------------------------------------- main
 def run():
-    BAL.clear(); ACCTS.clear(); _SOLP.clear(); FOMO_META.clear()
+    BAL.clear(); ACCTS.clear(); _SOLP.clear(); FOMO_META.clear(); RPC_FAILS.clear()
     state = load_state()
     cmds = read_commands(state)
     if not (os.environ.get("TELEGRAM_CHAT_ID") or state.get("chat_id")):
