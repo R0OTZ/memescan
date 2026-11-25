@@ -388,7 +388,7 @@ def entry_from_chain(owner, mint, sol_price):
                 sigs.append(s["signature"])
     tokens_in = cost = 0.0
     for sig in sigs[:25]:
-        tx = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+        tx = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}])
         if not tx:
             continue
         meta = tx.get("meta") or {}
@@ -438,7 +438,7 @@ def copy_watch(state, sol_price):
         for s in reversed(sigs):
             if s.get("err"):
                 continue
-            tx = rpc("getTransaction", [s["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+            tx = rpc("getTransaction", [s["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}])
             if not tx:
                 continue
             meta = tx.get("meta") or {}
