@@ -343,12 +343,19 @@ def wallet_tokens(owner):
     return None if failed == len(TOKEN_PROGRAMS) else res
 
 
+RPC_ERRS = {}
+
+
 def rpc(method, params):
     for url in RPCS:  # free RPCs rate-limit GitHub's shared IPs; fall through to the next one
         r = get_json(url, "POST", {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-        time.sleep(0.15)
+        time.sleep(0.4 if method == "getTransaction" else 0.15)
         if isinstance(r, dict) and "result" in r:
             return r["result"]
+        key = (method, url.split("//")[-1][:30])
+        if RPC_ERRS.get(key, 0) < 2:  # log the first couple of failures per endpoint, so problems are visible
+            RPC_ERRS[key] = RPC_ERRS.get(key, 0) + 1
+            log(f"RPC {method} failed at {key[1]}: {str((r or {}).get('error') if isinstance(r, dict) else 'no response')[:150]}")
     return None
 
 
