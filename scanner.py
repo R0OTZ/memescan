@@ -19,6 +19,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
+
+import market_intel as MI
+import portfolio as PF
 
 STATE_PATH = os.environ.get("STATE_PATH", "state/state_v2.json")
 SOL_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
@@ -53,6 +57,8 @@ CFG = dict(
     dip_min=0.15,            # a dip = 15-40% off the 2h high...
     dip_max=0.40,            # ...deeper than 40% is usually a dump, not a dip
     max_opps_per_hour=6,     # cap on BUY / #1 / dip alerts so Telegram doesn't turn into spam
+    summary_every=300,       # rebuild the /summary report every 5 minutes (GeckoTerminal rate limits)
+    pf_budget=25,            # wallet transactions to load per scan while history catches up
     digest_minutes=120,      # automatic summary every 2 hours
     realert_hours=3,
     watch_hours=6,
@@ -250,15 +256,18 @@ def metrics(p):
 
     b1, s1 = bs("h1")
     b5, s5 = bs("m5")
+    b24, s24 = bs("h24")
     created = p.get("pairCreatedAt")
     return dict(
         symbol=(p.get("baseToken") or {}).get("symbol") or "?",
         price=float(p.get("priceUsd") or 0),
         liq=f("liquidity", "usd"),
         mcap=float(p.get("marketCap") or p.get("fdv") or 0),
-        vol_h1=f("volume", "h1"),
+        fdv=float(p.get("fdv") or 0),
+        vol_h1=f("volume", "h1"), vol_m5=f("volume", "m5"), vol_h6=f("volume", "h6"), vol_h24=f("volume", "h24"),
         ch_m5=f("priceChange", "m5"), ch_h1=f("priceChange", "h1"), ch_h6=f("priceChange", "h6"),
-        b1=b1, s1=s1, b5=b5, s5=s5,
+        ch_h24=f("priceChange", "h24"),
+        b1=b1, s1=s1, b5=b5, s5=s5, b24=b24, s24=s24, pair=p.get("pairAddress") or "",
         age_min=(NOW * 1000 - created) / 60000 if created else None,
         url=p.get("url") or "",
     )
@@ -288,6 +297,22 @@ def rugcheck(mint):
     scale = 100.0 if pcts and max(pcts) <= 1.0 else 1.0  # tolerate fraction or percent
     out["insider_pct"] = sum(float(h.get("pct") or 0) * scale for h in holders if h.get("insider"))
     out["insider_wallets"] = int(r.get("graphInsidersDetected") or 0)
+    out["holders"] = r.get("totalHolders")
+    # top holders that are real wallets: drop pools, AMMs and lockers so they aren't mistaken for whales
+    pools = set()
+    for k, v in (r.get("knownAccounts") or {}).items():
+        if (v or {}).get("type") in ("AMM", "LOCKER"):
+            pools.add(k)
+    locked = []
+    for mk in r.get("markets") or []:
+        for key in ("pubkey", "liquidityA", "liquidityB"):
+            if isinstance(mk.get(key), str):
+                pools.add(mk[key])
+        if (mk.get("lp") or {}).get("lpLockedPct") is not None:
+            locked.append(float(mk["lp"]["lpLockedPct"]))
+    out["lp_locked"] = max(locked) if locked else None
+    out["top_raw"] = [(h.get("owner"), float(h.get("pct") or 0) * scale) for h in holders
+                      if h.get("owner") not in pools and h.get("address") not in pools][:15]
     if out["insider_pct"] >= CFG["max_insider_pct"]:
         out["fails"].append(f"linked insider wallets hold {out['insider_pct']:.1f}% of supply")
     out["ok"] = not out["fails"]
@@ -597,8 +622,9 @@ def find_dips(hist, pairs, rug_for):
     return sorted(out, key=lambda x: -x[0])
 
 
-HELP_TEXT = ("<b>MemeScan</b>\n/best: top coins on fomo right now\n/positions: your coins, P&amp;L, buying power\n"
-             "/copy: what the traders you follow did\n/stats: how the bot's calls have done\n\n"
+HELP_TEXT = ("<b>MemeScan</b>\n/summary: trending coin intelligence (add a number, e.g. /summary 2, for a full breakdown)\n"
+             "/stats: your balance, P&amp;L, holdings, history and risk\n/best: top coins on fomo right now\n"
+             "/copy: what the traders you follow did\nAlso: /positions, /calls (how the bot's own calls did)\n\n"
              "<b>Automatic alerts</b> (no command needed)\n🏆 new #1 on fomo · 🟢 buy setups · 📉 dips on strong coins\n"
              "👥 copy trades · 🚨 sell / stop / take-profit on your coins · 🧾 summary every 2h\n"
              "Buy-type alerts are capped at 6 per hour.")
@@ -764,6 +790,29 @@ def update_calls(state, prices):
                 c["hit"] = "2x"
             elif p <= c["price"] * (1 + CFG["stop_pct"] / 100):
                 c["hit"] = "stop"
+
+
+def stamp_now():
+    return datetime.fromtimestamp(NOW, PF.TZ).strftime("%I:%M %p ET").lstrip("0")
+
+
+def fomo_growth(state, mint):
+    """Holder growth per hour from the bot's samples of fomo's holder count (None until 15+ min of history)."""
+    h = (state.get("fomo_hist") or {}).get(mint) or []
+    now_h = (FOMO_META.get(mint) or {}).get("holders") or 0
+    old = [x for x in h if NOW - x[0] >= 900]
+    if not old or not old[0][1] or not now_h:
+        return None
+    then = min(old, key=lambda x: abs((NOW - x[0]) - 3600))
+    return (now_h - then[1]) / then[1] / ((NOW - then[0]) / 3600)
+
+
+ALERT_WHY = dict(
+    liq="Liquidity leaving can mean the team or big holders are pulling out; selling gets harder and pricier.",
+    whale="When top holders sell, there's less support under the price.",
+    vol="Fading volume often comes before a slow bleed: fewer buyers to sell to.",
+    volat="Big fast swings mean your stop can be skipped past.",
+    mc="A move this big in an hour often partly reverses.")
 
 
 def stats_text(state):
@@ -1039,6 +1088,148 @@ def run():
             dip_seen[mint] = NOW
             record_call(state, mint, m, dict(j, verdict="DIP"))
     state["dip_alerted"] = dip_seen
+
+    # ---------------------------------------------------------------- intelligence: /summary, /stats, holding alerts
+    stamp = stamp_now()
+    hs = state.setdefault("hsnap", {})
+    dev0 = state.setdefault("dev0", {})
+    gtc = {k: v for k, v in state.get("gt_trades", {}).items() if NOW - v[0] < 3600}
+    state["gt_trades"] = gtc
+
+    def rich_rug(mint, pair_addr):
+        rk = cached_rug(mint)
+        if not rk:
+            return None
+        rk = dict(rk)
+        cb = rk.get("creator_bal")
+        if cb is not None:
+            base = dev0.setdefault(mint, cb)
+            rk["dev_drop"] = (1 - float(cb) / float(base)) if base else None
+        rk["top"] = [(o, p) for o, p in rk.get("top_raw", []) if o and o != pair_addr][:15]
+        snaps = [s for s in hs.get(mint, []) if NOW - s[0] < 6 * 3600]
+        if rk["top"] and (not snaps or NOW - snaps[-1][0] >= 600):
+            snaps.append([NOW, {o: round(p, 4) for o, p in rk["top"]}])
+        hs[mint] = snaps
+        return rk
+
+    def big_trades(pair_addr):
+        if not pair_addr:
+            return None
+        c = gtc.get(pair_addr)
+        if c and NOW - c[0] < 300:
+            return [dict(ts=r[0], kind=r[1], usd=r[2], wallet=r[3]) for r in c[1]]
+        data = get_json(f"{GT}/networks/solana/pools/{pair_addr}/trades?trade_volume_in_usd_greater_than=50", tries=1)
+        if not isinstance(data, dict):
+            return [dict(ts=r[0], kind=r[1], usd=r[2], wallet=r[3]) for r in c[1]] if c else None
+        rows = []
+        for t in data.get("data") or []:
+            a = t.get("attributes") or {}
+            try:
+                ts = datetime.fromisoformat(a["block_timestamp"].replace("Z", "+00:00")).timestamp()
+                rows.append([ts, a.get("kind"), round(float(a.get("volume_in_usd") or 0), 2), a.get("tx_from_address")])
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+        gtc[pair_addr] = [NOW, rows]
+        return [dict(ts=r[0], kind=r[1], usd=r[2], wallet=r[3]) for r in rows]
+
+    def intel_input(mint):
+        p = pairs.get(mint)
+        if not p:
+            return None
+        m = metrics(p)
+        return dict(mint=mint, m=m, fm=FOMO_META.get(mint), rk=rich_rug(mint, m["pair"]),
+                    px=(state.get("px") or {}).get(mint, []), snaps=hs.get(mint, []),
+                    trades=big_trades(m["pair"]), holder_growth=fomo_growth(state, mint))
+
+    sc = state.get("summary_cache") or {}
+    if NOW - sc.get("ts", 0) >= CFG["summary_every"] or not sc.get("msgs"):
+        hot = [mi for mi in sorted(FOMO_META, key=lambda k: -FOMO_META[k]["vol1"]) if mi in pairs][:8]
+        live_top = [mi for mi, _ in sorted(live, key=lambda x: -x[1]["vol_h1"])][:8]
+        cands = list(dict.fromkeys(hot + live_top))[:12]
+        inputs = [x for x in (intel_input(mi) for mi in cands) if x]
+        smsgs, sdetails, _ = MI.build_report(inputs, NOW, stamp)
+        sc = dict(ts=NOW, msgs=smsgs, details={str(k): v for k, v in sdetails.items()})
+        state["summary_cache"] = sc
+    for mint in [k for k in hs if NOW - (hs[k][-1][0] if hs[k] else 0) > 6 * 3600]:
+        hs.pop(mint)
+
+    intel = {}
+    for mint in state["positions"]:
+        x = intel_input(mint)
+        if x:
+            intel[mint] = MI.analyze(x, NOW)
+    pfs = state.setdefault("pf", {})
+    pal = [a for a in pfs.get("alerts", []) if NOW - a["ts"] < 2 * 86400]
+    akeys = {k: v for k, v in pfs.get("alert_keys", {}).items() if NOW - v < 86400}
+    for mint, a in intel.items():
+        mm, checks = a["m"], []
+        if a["liq_chg"] is not None and a["liq_chg"] <= -25:
+            checks.append(("liq", f"liquidity dropped {a['liq_chg']:.0f}% in the last hour (now {usd(mm['liq'])})"))
+        mv = [x for x in a["whales"]["holder_moves"] if x[1] <= -1.0]
+        if mv:
+            checks.append(("whale", f"top holder {MI.short(mv[0][0])} sold {abs(mv[0][1]):.1f}% of supply "
+                                    f"in {mv[0][3] / 60:.0f} min"))
+        if a["a6"] is not None and a["a6"] <= 0.35 and mm.get("vol_h6", 0) >= 5000:
+            checks.append(("vol", f"volume collapsed: last hour is {a['a6']:.1f}x its 6h hourly average"))
+        if abs(mm["ch_m5"]) >= 20:
+            checks.append(("volat", f"moved {mm['ch_m5']:+.0f}% in 5 minutes"))
+        if abs(mm["ch_h1"]) >= 40:
+            checks.append(("mc", f"market cap {mm['ch_h1']:+.0f}% in an hour (now {usd(mm['mcap'])})"))
+        for key, text in checks:
+            k = f"{mint}:{key}"
+            if NOW - akeys.get(k, 0) < 7200:
+                continue
+            akeys[k] = NOW
+            pal.append(dict(ts=NOW, sym=mm["symbol"], text=text))
+            msgs.append(f"⚠️ <b>${html.escape(mm['symbol'])}</b> · {stamp}\n{html.escape(text)}\n"
+                        f"<i>{ALERT_WHY[key]}</i>\n{html.escape(mm['url'])}")
+    pfs["alerts"], pfs["alert_keys"] = pal[-50:], akeys
+
+    if wallet and held_ok:
+        try:
+            PF.sync(pfs, wallet, rpc, USD_STABLES, budget=CFG["pf_budget"])
+            need = [e["ts"] for e in pfs["events"].values() if not e.get("skip") and (e.get("sol") or e.get("fee"))]
+            PF.ensure_sol_prices(pfs, need, lambda u: get_json(u, tries=1))
+        except Exception as e:
+            log(f"portfolio sync failed: {type(e).__name__}: {e}")
+        if len(pfs.get("events", {})) > 4000:
+            keep = sorted(pfs["events"].items(), key=lambda kv: -kv[1].get("ts", 0))[:4000]
+            pfs["events"] = dict(keep)
+        L = PF.ledger(pfs)
+        cm = pfs.setdefault("chase_map", {})
+        for t in L["trades"]:
+            key = f"{t['mint']}:{int(t['ts'])}"
+            if t["kind"] != "buy" or key in cm:
+                continue
+            h = (state.get("px") or {}).get(t["mint"]) or []
+            if h and h[0][0] <= t["ts"] - 3300 and t["ts"] <= h[-1][0] + 120:
+                p0 = min(h, key=lambda x: abs(x[0] - (t["ts"] - 3600)))[1]
+                p1 = min(h, key=lambda x: abs(x[0] - t["ts"]))[1]
+                if p0:
+                    cm[key] = round((p1 / p0 - 1) * 100, 1)
+        pfs["chase"] = list(cm.values())
+        rows_h = []
+        for mint, qty in held.items():
+            p = pairs.get(mint)
+            if not p:
+                continue
+            mm = metrics(p)
+            if qty * mm["price"] < 0.01:
+                continue
+            rows_h.append(dict(mint=mint, sym=mm["symbol"], qty=qty, price=mm["price"], value=qty * mm["price"],
+                               liq=mm["liq"], mcap=mm["mcap"], ch_h1=mm["ch_h1"], ch_h24=mm["ch_h24"]))
+        wallet_now = dict(ok=bp is not None, stable=(bp or {}).get("stable", 0.0), sol=(bp or {}).get("sol", 0.0),
+                          sol_usd=(bp or {}).get("sol_usd", 0.0))
+        if bp:
+            pfs.setdefault("daily_value", {})[PF.day_of(NOW)] = round(
+                bp["stable"] + bp["sol_usd"] + sum(r["value"] for r in rows_h), 2)
+        stats_msgs = PF.build_stats(pfs, L, wallet_now, rows_h, intel, NOW, stamp, calls_text="1")
+        log(f"portfolio: {L['n_events']} events, complete={pfs.get('complete')}, pending={len(pfs.get('pending', []))}")
+    elif wallet:
+        stats_msgs = (state.get("stats_cache") or ["Couldn't read your wallet this run. Try again in a minute."])
+    else:
+        stats_msgs = ["Add your wallet address as the WALLET secret to get portfolio stats."]
+    state["stats_cache"] = stats_msgs
     state["alerted"] = {k: v for k, v in state["alerted"].items() if NOW - v < 86400}
     state["last_judged"] = [dict(mint=mi, sym=m["symbol"], verdict=j["verdict"], score=j["score"],
                                  why="; ".join(j["reasons"])[:90], price=m["price"])
@@ -1052,11 +1243,11 @@ def run():
         return (f"{tag} <b>${html.escape(m['symbol'])}</b> {px(m['price'])} · 1h {m['ch_h1']:+.0f}% · "
                 f"MC {usd(m['mcap'])}{extra}")
 
-    if state.get("menu_set") != 5:  # (re)send the command menu when it changes
+    if state.get("menu_set") != 6:  # (re)send the command menu when it changes
         tg("setMyCommands", commands=[dict(command=c, description=d) for c, d in (
-            ("best", "Top coins on fomo right now"), ("positions", "Your coins, P&L and buying power"),
-            ("copy", "What the traders you follow did"), ("stats", "How the bot's calls have done"))])
-        state["menu_set"] = 5
+            ("summary", "Trending coin intelligence report"), ("stats", "Your portfolio and trading performance"),
+            ("best", "Top coins on fomo right now"), ("copy", "What the traders you follow did"))])
+        state["menu_set"] = 6
 
     def answer(c):
         msgs = []
@@ -1138,12 +1329,16 @@ def run():
                 d_ = tot_now - tot_in
                 msgs.append(f"<b>Total</b>: put in {money(tot_in)} → now {money(tot_now)} "
                             f"({'+' if d_ >= 0 else ''}{money(d_)})")
-        elif c == "/stats":
+        elif c == "/calls":
             msgs.append(stats_text(state))
         return msgs
 
-    snapshot = {c: answer(c) for c in ("/best", "/positions", "/copy", "/stats", "/help",  # menu + help
+    snapshot = {c: answer(c) for c in ("/best", "/positions", "/copy", "/calls", "/help",  # menu + help
                                        "/buy", "/fomo", "/gainers", "/graduated", "/balance", "/trending")}  # still work
+    snapshot["/summary"] = sc["msgs"]
+    snapshot["/stats"] = stats_msgs
+    for k, v in sc.get("details", {}).items():
+        snapshot[f"/summary#{k}"] = [v]
     if NOW - state.get("digest_ts", 0) >= CFG["digest_minutes"] * 60:
         state["digest_ts"] = NOW
         top = "\n".join(f"{i + 1}. <b>${html.escape(m['symbol'])}</b> {s}/100 · {html.escape(best_why(m, d))}"
