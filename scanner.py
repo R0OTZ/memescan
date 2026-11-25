@@ -608,8 +608,10 @@ HELP_TEXT = ("<b>MemeScan</b>\n/best: top coins on fomo right now\n/positions: y
 def usd(x):
     if x >= 1e6:
         return f"${x / 1e6:.2f}M"
-    if x >= 1e3:
+    if x >= 1e5:
         return f"${x / 1e3:.0f}k"
+    if x >= 1e3:
+        return f"${x / 1e3:.1f}k"
     return f"${x:,.2f}"
 
 
@@ -670,6 +672,35 @@ def card(mint, m, rk, j, tags):
     lines.append(f"<code>{e(mint)}</code>")
     if m["url"]:
         lines.append(e(m["url"]))
+    return "\n".join(lines)
+
+
+def money(x):
+    """Dollar amounts for small positions: always 2 decimals, e.g. $0.25, $1.26, $1,240.00."""
+    return f"-${abs(x):,.2f}" if x < 0 else f"${x:,.2f}"
+
+
+def pos_text(ps, m):
+    """One position in plain dollars: what you put in, what it's worth, where the exits are (value + market cap)."""
+    price, entry, value = m["price"], ps["entry"], ps.get("value", 0.0)
+    invested = value * entry / price if price else 0.0
+    mc_at = lambda p: usd(m["mcap"] * p / price) if price and m["mcap"] else "?"
+    stop_p = entry * (1 + CFG["stop_pct"] / 100)
+    pnl = value - invested
+    icon = "🟢" if pnl > 0.005 else "🔴" if pnl < -0.005 else "⚪"
+    lines = [f"{icon} <b>${html.escape(ps['sym'])}</b>  {(price / entry - 1) * 100:+.0f}%",
+             f"Put in {money(invested)} → now {money(value)} ({'+' if pnl >= 0 else ''}{money(pnl)})"]
+    if ps.get("tp"):
+        trail = ps["peak"] * (1 + CFG["trail_from_peak"] / 100)
+        lines.append(f"📉 Already hit 2x. Sell the rest if it falls to {money(value * trail / price)} "
+                     f"(market cap {mc_at(trail)})")
+    else:
+        lines.append(f"🛑 Stop-loss: sell if it drops to {money(invested * (1 + CFG['stop_pct'] / 100))} "
+                     f"(market cap {mc_at(stop_p)})")
+        lines.append(f"💰 Take profit: at {money(invested * CFG['tp_mult'])} (market cap {mc_at(entry * CFG['tp_mult'])}) "
+                     f"sell at least your {money(invested)} back")
+    src_ = "from your buy transactions" if ps.get("src") == "chain" else "estimated: price when the bot first saw it"
+    lines.append(f"Market cap now {usd(m['mcap'])} · entry {src_}")
     return "\n".join(lines)
 
 
@@ -797,9 +828,8 @@ def check_positions(state, held, pairs, rugs, owner=""):
         if "announced" not in ps:
             ps["announced"] = True
             how = "from your buy transactions" if ps.get("src") == "chain" else "estimate: price when first seen"
-            alerts.append(f"👀 Watching your <b>${html.escape(m['symbol'])}</b> ({usd(value)}, "
-                          f"{(m['price'] / ps['entry'] - 1) * 100:+.0f}%). Entry {px(ps['entry'])} ({how}). "
-                          f"Stop at {px(ps['entry'] * (1 + CFG['stop_pct'] / 100))}.")
+            ps["value"] = value
+            alerts.append("👀 <b>Now watching</b>\n" + pos_text(ps, m))
         ps["peak"] = max(ps["peak"], m["price"])
         ps["value"] = value
         chg = (m["price"] / ps["entry"] - 1) * 100
@@ -1095,12 +1125,19 @@ def run():
             msgs += answer("/balance")
             if not state["positions"]:
                 msgs.append("No open positions seen in your wallet.")
+            tot_in = tot_now = 0.0
             for mint, ps in state["positions"].items():
                 p = pairs.get(mint)
                 if p:
                     m = metrics(p)
-                    msgs.append(f"<b>${html.escape(ps['sym'])}</b> {(m['price'] / ps['entry'] - 1) * 100:+.0f}% "
-                                f"· value {usd(ps.get('value', 0))} · stop {px(ps['entry'] * (1 + CFG['stop_pct'] / 100))}")
+                    msgs.append(pos_text(ps, m))
+                    if m["price"]:
+                        tot_now += ps.get("value", 0.0)
+                        tot_in += ps.get("value", 0.0) * ps["entry"] / m["price"]
+            if state["positions"]:
+                d_ = tot_now - tot_in
+                msgs.append(f"<b>Total</b>: put in {money(tot_in)} → now {money(tot_now)} "
+                            f"({'+' if d_ >= 0 else ''}{money(d_)})")
         elif c == "/stats":
             msgs.append(stats_text(state))
         return msgs
