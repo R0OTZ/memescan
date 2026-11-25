@@ -59,6 +59,7 @@ CFG = dict(
     max_opps_per_hour=6,     # cap on BUY / #1 / dip alerts so Telegram doesn't turn into spam
     summary_every=300,       # rebuild the /summary report every 5 minutes (GeckoTerminal rate limits)
     pf_budget=25,            # wallet transactions to load per scan while history catches up
+    gt_trades_per_run=3,     # large-trade feeds fetched per scan (each kept 10 min)
     digest_minutes=120,      # automatic summary every 2 hours
     realert_hours=3,
     watch_hours=6,
@@ -1112,12 +1113,16 @@ def run():
         hs[mint] = snaps
         return rk
 
+    gt_quota = [CFG["gt_trades_per_run"]]
+
     def big_trades(pair_addr):
         if not pair_addr:
             return None
         c = gtc.get(pair_addr)
-        if c and NOW - c[0] < 300:
-            return [dict(ts=r[0], kind=r[1], usd=r[2], wallet=r[3]) for r in c[1]]
+        if (c and NOW - c[0] < 600) or gt_quota[0] <= 0:  # GeckoTerminal allows few calls a minute: pace them
+            return [dict(ts=r[0], kind=r[1], usd=r[2], wallet=r[3]) for r in c[1]] if c else None
+        gt_quota[0] -= 1
+        time.sleep(2.5)
         data = get_json(f"{GT}/networks/solana/pools/{pair_addr}/trades?trade_volume_in_usd_greater_than=50", tries=1)
         if not isinstance(data, dict):
             return [dict(ts=r[0], kind=r[1], usd=r[2], wallet=r[3]) for r in c[1]] if c else None
