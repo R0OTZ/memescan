@@ -54,6 +54,11 @@ STABLES = {"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",   # USDC
            "So11111111111111111111111111111111111111112"}  # wrapped SOL
 
 NOW = time.time()
+ACCTS = {}  # mint -> your token account addresses (filled by wallet_tokens)
+USD_STABLES = ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY2QdWXJN3YUiR1GaEz",
+               "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY2QdWX2ZCG7FrPKdDhUmJ")
+WSOL = "So11111111111111111111111111111111111111112"
+ATA_RENT_SOL = 0.00203928  # refundable rent when a token account is created; not part of your cost
 
 
 def log(msg):
@@ -237,7 +242,61 @@ def wallet_tokens(owner):
                 continue
             if amt > 0 and info["mint"] not in STABLES:
                 res[info["mint"]] = res.get(info["mint"], 0) + amt
+                ACCTS.setdefault(info["mint"], []).append(a.get("pubkey"))
     return None if failed == len(TOKEN_PROGRAMS) else res
+
+
+def rpc(method, params):
+    r = get_json(SOL_RPC, "POST", {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    time.sleep(0.15)  # public RPC is rate-limited
+    return (r or {}).get("result") if isinstance(r, dict) else None
+
+
+def sol_usd():
+    p = pairs_for([WSOL]).get(WSOL)
+    return float(p.get("priceUsd") or 0) if p else 0.0
+
+
+def entry_from_chain(owner, mint, sol_price):
+    """Average USD price you actually paid, read from your buy transactions. None if it can't tell."""
+    sigs = []
+    for acct in ACCTS.get(mint, []):
+        for s in rpc("getSignaturesForAddress", [acct, {"limit": 25}]) or []:
+            if not s.get("err"):
+                sigs.append(s["signature"])
+    tokens_in = cost = 0.0
+    for sig in sigs[:25]:
+        tx = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+        if not tx:
+            continue
+        meta = tx.get("meta") or {}
+        pre, post = meta.get("preTokenBalances") or [], meta.get("postTokenBalances") or []
+
+        def bal(lst, m):
+            return sum(float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                       for b in lst if b.get("owner") == owner and b.get("mint") == m)
+
+        got = bal(post, mint) - bal(pre, mint)
+        if got <= 0:
+            continue  # a sell or transfer out
+        spent = sum(max(0.0, bal(pre, q) - bal(post, q)) for q in USD_STABLES)
+        spent += max(0.0, bal(pre, WSOL) - bal(post, WSOL)) * sol_price
+        keys = [k.get("pubkey") if isinstance(k, dict) else k
+                for k in ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []]
+        if owner in keys:
+            i = keys.index(owner)
+            try:
+                dsol = (meta["preBalances"][i] - meta["postBalances"][i]) / 1e9
+            except (KeyError, IndexError, TypeError):
+                dsol = 0.0
+            if not any(b.get("owner") == owner and b.get("mint") == mint for b in pre):
+                dsol -= ATA_RENT_SOL  # account was opened in this tx
+            spent += max(0.0, dsol) * sol_price
+        if spent <= 0:
+            continue  # airdrop or transfer in: cost unknown
+        tokens_in += got
+        cost += spent
+    return cost / tokens_in if tokens_in > 0 else None
 
 
 # ---------------------------------------------------------------- judging
@@ -309,6 +368,18 @@ def px(x):
     return "$" + f"{x:.{max(4, head + 2)}f}"
 
 
+def odds_line(state, score):
+    """Prediction from the bot's own record: how often similar BUY calls hit 2x before the stop."""
+    past = [c for c in state["calls"] if c["verdict"] == "BUY" and c.get("hit") in ("2x", "stop")
+            and abs(c["score"] - score) <= 10]
+    be = -CFG["stop_pct"] / ((CFG["tp_mult"] - 1) * 100 - CFG["stop_pct"])
+    if len(past) < 15:
+        return f"Odds: not enough history yet ({len(past)}/15 similar calls resolved)"
+    w = sum(c["hit"] == "2x" for c in past)
+    return (f"Odds: {w}/{len(past)} similar past calls ({w / len(past):.0%}) hit 2x before the stop "
+            f"(break-even \u2248{be:.0%} before fees)")
+
+
 def card(mint, m, rk, j, tags):
     e = html.escape
     icon = {"BUY": "🟢", "WAIT": "🟡", "AVOID": "🔴"}[j["verdict"]]
@@ -325,6 +396,8 @@ def card(mint, m, rk, j, tags):
         stop = m["price"] * (1 + CFG["stop_pct"] / 100)
         lines.append(f"Plan: ${CFG['stake_usd']:.0f} in. At {CFG['tp_mult']:.0f}x sell at least your stake back. "
                      f"Stop {CFG['stop_pct']:.0f}% ({px(stop)}).")
+    if j.get("odds"):
+        lines.append(j["odds"])
     if j.get("target"):
         lines.append(f"Entry: wait for {px(j['target'])}. I'll ping you if it gets there and still looks safe.")
     if "boosted" in tags:
@@ -419,9 +492,10 @@ def stats_text(state):
 
 
 # ---------------------------------------------------------------- positions
-def check_positions(state, held, pairs, rugs):
+def check_positions(state, held, pairs, rugs, owner=""):
     alerts = []
     pos = state["positions"]
+    sol_price = None
     for mint in list(pos):
         if mint not in held:
             pos.pop(mint)  # sold (or moved)
@@ -437,9 +511,20 @@ def check_positions(state, held, pairs, rugs):
         ps = pos.get(mint)
         if not ps:
             ps = pos[mint] = dict(entry=m["price"], peak=m["price"], since=NOW, tp=False, sent=[],
-                                  creator_bal=(rk or {}).get("creator_bal"), sym=m["symbol"])
-            alerts.append(f"👀 Watching your <b>${html.escape(m['symbol'])}</b> ({usd(value)}). "
-                          f"Entry estimate {px(ps['entry'])} (price when first seen). "
+                                  creator_bal=(rk or {}).get("creator_bal"), sym=m["symbol"], src="seen")
+        if ps.get("src") != "chain" and owner and ps.get("tries", 0) < 5:
+            ps["tries"] = ps.get("tries", 0) + 1
+            if sol_price is None:
+                sol_price = sol_usd()
+            real = entry_from_chain(owner, mint, sol_price) if sol_price else None
+            if real:
+                ps["entry"], ps["src"] = real, "chain"
+                ps["peak"] = max(m["price"], real)
+        if "announced" not in ps:
+            ps["announced"] = True
+            how = "from your buy transactions" if ps.get("src") == "chain" else "estimate: price when first seen"
+            alerts.append(f"👀 Watching your <b>${html.escape(m['symbol'])}</b> ({usd(value)}, "
+                          f"{(m['price'] / ps['entry'] - 1) * 100:+.0f}%). Entry {px(ps['entry'])} ({how}). "
                           f"Stop at {px(ps['entry'] * (1 + CFG['stop_pct'] / 100))}.")
         ps["peak"] = max(ps["peak"], m["price"])
         ps["value"] = value
@@ -521,7 +606,7 @@ def run():
     msgs = []
     # positions first: exits matter more than entries
     if held_ok:
-        msgs += check_positions(state, held, pairs, rugs)
+        msgs += check_positions(state, held, pairs, rugs, wallet)
     holding = any(p.get("value", 0) >= 1 for p in state["positions"].values())
 
     buys = []  # (rank, mint, m, rk, j): your stake covers ONE position, so only the best gets a card
@@ -564,6 +649,7 @@ def run():
         record_call(state, mint, m, j)  # every BUY is graded in /stats, even ones not sent
         state["alerted"][mint] = NOW
         if i == 0:
+            j["odds"] = odds_line(state, j["score"])
             others = ", ".join("$" + html.escape(b[2]["symbol"]) for b in buys[1:4])
             msgs.append(card(mint, m, rk, j, tags.get(mint, [])) +
                         (f"\nAlso qualifying (weaker): {others}" if others else ""))
