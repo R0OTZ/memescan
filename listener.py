@@ -14,7 +14,7 @@ import urllib.request
 STATE_DIR = os.path.dirname(os.environ.get("STATE_PATH", "state/state_v2.json")) or "."
 TG_PATH = os.path.join(STATE_DIR, "tg.json")
 SNAP_PATH = os.path.join(STATE_DIR, "snapshot.json")
-HELP = "Commands: /buy /fomo /copy /trending /gainers /graduated /balance /positions /stats"
+HELP = "Commands: /best /buy /fomo /copy /trending /gainers /graduated /balance /positions /stats"
 
 
 def call(method, params, timeout=40):
