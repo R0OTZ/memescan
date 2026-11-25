@@ -99,6 +99,31 @@ def get_json(url, method="GET", body=None, timeout=15, tries=3):
             return None
 
 
+def cached_get(url, ttl):
+    """GET with a small on-disk cache, for rate-limited feeds (GeckoTerminal allows few calls per minute)."""
+    path = os.path.join(os.path.dirname(STATE_PATH) or ".", "http_cache.json")
+    try:
+        with open(path) as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    hit = cache.get(url)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    data = get_json(url, tries=1)
+    if data is None:
+        return hit[1] if hit else None  # serve stale data rather than nothing
+    cache[url] = [time.time(), data]
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump({k: v for k, v in cache.items() if time.time() - v[0] < 3600}, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+    return data
+
+
 # ---------------------------------------------------------------- state
 def load_state():
     try:
@@ -169,7 +194,7 @@ def discover():
         for it in as_list(get_json(DS + path))[:40]:
             if it.get("chainId") == "solana":
                 add(it.get("tokenAddress"), tag)
-    for p in as_list(get_json(GT + "/networks/solana/trending_pools?page=1")):
+    for p in as_list(cached_get(GT + "/networks/solana/trending_pools?page=1", 180)):
         bid = (((p.get("relationships") or {}).get("base_token") or {}).get("data") or {}).get("id", "")
         if bid.startswith("solana_"):
             add(bid[len("solana_"):], "gecko trending")
@@ -177,7 +202,7 @@ def discover():
     for url, tag in ((GT + "/networks/solana/new_pools?include=dex&page=1", "just graduated"),
                      (GT + "/networks/solana/new_pools?include=dex&page=2", "just graduated"),
                      (GT + "/networks/solana/dexes/pumpswap/pools?sort=h24_volume_usd_desc&page=1", "graduated")):
-        for p in as_list(get_json(url)):
+        for p in as_list(cached_get(url, 180)):
             rel = p.get("relationships") or {}
             dex = ((rel.get("dex") or {}).get("data") or {}).get("id", "")
             if "new_pools" in url and dex != "pumpswap":
