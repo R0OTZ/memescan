@@ -633,12 +633,22 @@ def run():
         pending.append((mint, m))
     pending.sort(key=lambda x: -(x[1]["vol_h1"] / max(x[1]["liq"], 1)))
     must_check = [k for k in dict.fromkeys(held_mints + list(state["watch"])) if k in pairs]
+    rc_cache = {k: v for k, v in state.get("rc_cache", {}).items() if NOW - v[0] < 600}
+    state["rc_cache"] = rc_cache  # reuse a coin's rug check for 10 min (your holdings are always re-checked)
+
+    def cached_rug(mint):
+        if mint in rc_cache:
+            return rc_cache[mint][1]
+        r = rugcheck(mint)
+        time.sleep(0.3)
+        if r is not None:
+            rc_cache[mint] = [NOW, r]
+        return r
     for mint in must_check:
         rugs[mint] = rugcheck(mint)
         time.sleep(0.3)
     for mint, m in pending[:CFG["max_rugchecks"]]:
-        rk = rugs.get(mint) or rugcheck(mint)
-        time.sleep(0.3)
+        rk = rugs.get(mint) or cached_rug(mint)
         if rk is None:
             continue
         rugs[mint] = rk
