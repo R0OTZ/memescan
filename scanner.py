@@ -50,6 +50,10 @@ CFG = dict(
     dev_sell_drop=0.20,      # creator balance down 20%+ = dev selling
     max_rugchecks=30,        # per run, to stay polite to the free API
     best_alert_score=70,     # ping when a coin at or above this score takes #1 on /best
+    dip_min=0.15,            # a dip = 15-40% off the 2h high...
+    dip_max=0.40,            # ...deeper than 40% is usually a dump, not a dip
+    max_opps_per_hour=6,     # cap on BUY / #1 / dip alerts so Telegram doesn't turn into spam
+    digest_minutes=120,      # automatic summary every 2 hours
     realert_hours=3,
     watch_hours=6,
 )
@@ -550,6 +554,56 @@ def best_why(m, d):
     return " · ".join(bits)
 
 
+def track_prices(state, pairs, mints):
+    """Price + liquidity history (every ~90s, kept 2.5h) for live coins, used to spot dips."""
+    hist, keep = state.setdefault("px", {}), set(mints)
+    for mint in keep:
+        p = pairs.get(mint)
+        if not p:
+            continue
+        m = metrics(p)
+        h = [x for x in hist.get(mint, []) if NOW - x[0] < 9000]
+        if m["price"] > 0 and (not h or NOW - h[-1][0] >= 90):
+            h.append([NOW, m["price"], m["liq"]])
+        hist[mint] = h
+    for k in [k for k in hist if k not in keep]:
+        hist.pop(k)
+    return hist
+
+
+def find_dips(hist, pairs, rug_for):
+    """Strong coins 15-40% off their 2h high, liquidity intact, buyers stepping back in."""
+    out = []
+    for mint, h in hist.items():
+        if len(h) < 10 or NOW - h[0][0] < 3600 or mint not in pairs:
+            continue  # need an hour of history first
+        m = metrics(pairs[mint])
+        recent = [x for x in h if NOW - x[0] <= 7200]
+        hi = max(x[1] for x in recent)
+        dd = 1 - m["price"] / hi if hi else 0
+        if not (CFG["dip_min"] <= dd <= CFG["dip_max"]):
+            continue
+        if m["liq"] < CFG["min_liq"] or m["liq"] < 0.8 * max(x[2] for x in recent):
+            continue  # liquidity being pulled is a rug, not a dip
+        if not (m["ch_h6"] > 0 or FOMO_META.get(mint, {}).get("ch4", 0) > 0):
+            continue  # only dips inside an uptrend
+        if m["ch_m5"] < 0 or m["b5"] < m["s5"]:
+            continue  # still falling: wait for buyers to step back in
+        if len(recent) >= 2 and m["price"] < recent[-2][1] * 0.99:
+            continue  # lower than the last check: still falling, wait for it to hold
+        rk = rug_for(mint)
+        if rk and rk["ok"]:
+            out.append((dd, mint, m, rk, hi))
+    return sorted(out, key=lambda x: -x[0])
+
+
+HELP_TEXT = ("<b>MemeScan</b>\n/best: top coins on fomo right now\n/positions: your coins, P&amp;L, buying power\n"
+             "/copy: what the traders you follow did\n/stats: how the bot's calls have done\n\n"
+             "<b>Automatic alerts</b> (no command needed)\n🏆 new #1 on fomo · 🟢 buy setups · 📉 dips on strong coins\n"
+             "👥 copy trades · 🚨 sell / stop / take-profit on your coins · 🧾 summary every 2h\n"
+             "Buy-type alerts are capped at 6 per hour.")
+
+
 # ---------------------------------------------------------------- formatting
 def usd(x):
     if x >= 1e6:
@@ -686,7 +740,7 @@ def stats_text(state):
     if not calls:
         return "No calls logged yet."
     out = [f"<b>Call log</b> ({len(calls)} calls since {time.strftime('%b %d', time.gmtime(calls[0]['ts']))})"]
-    for v in ("BEST", "BUY", "COPY", "WAIT", "AVOID"):
+    for v in ("BEST", "DIP", "BUY", "COPY", "WAIT", "AVOID"):
         cs = [c for c in calls if c["verdict"] == v]
         if not cs:
             continue
@@ -853,6 +907,15 @@ def run():
         return (f"Buying power {usd(bp['usd'])}: enough for {n} buy(s) at {usd(stake)}" if n else
                 f"Buying power {usd(bp['usd'])}: below the {usd(stake)} minimum")
 
+    def opp(text):
+        """Send a buy-type alert unless the hourly cap is reached. Exit alerts never go through here."""
+        times = [t for t in state.get("opp_times", []) if NOW - t < 3600]
+        if len(times) >= CFG["max_opps_per_hour"]:
+            return False
+        state["opp_times"] = times + [NOW]
+        msgs.append(text)
+        return True
+
     buys = []  # (rank, mint, m, rk, j): your stake covers ONE position, so only the best gets a card
     # dip watch -> BUY when target reached and still safe
     for mint in list(state["watch"]):
@@ -881,8 +944,7 @@ def run():
             if can_buy:
                 buys.append((j["score"], mint, m, rk, j))
         elif j["verdict"] == "WAIT" and j.get("target") and mint not in state["watch"]:
-            state["watch"][mint] = dict(target=j["target"], set=NOW, sym=m["symbol"])
-            msgs.append(card(mint, m, rk, j, tags.get(mint, [])))
+            state["watch"][mint] = dict(target=j["target"], set=NOW, sym=m["symbol"])  # silent: alerts only if it dips there
             record_call(state, mint, m, j)
             state["alerted"][mint] = NOW
         elif j["verdict"] == "AVOID" and rk is not None:
@@ -896,8 +958,8 @@ def run():
             j["odds"] = odds_line(state, j["score"])
             j["power"] = power_line()
             others = ", ".join("$" + html.escape(b[2]["symbol"]) for b in buys[1:4])
-            msgs.append(card(mint, m, rk, j, tags.get(mint, [])) +
-                        (f"\nAlso qualifying (weaker): {others}" if others else ""))
+            opp(card(mint, m, rk, j, tags.get(mint, [])) +
+                (f"\nAlso qualifying (weaker): {others}" if others else ""))
     if COPY:
         events = copy_watch(state, sol_usd())
         cp = pairs_for([e[2] for e in events]) if events else {}
@@ -930,11 +992,23 @@ def run():
         s, mint, m, rk, d = best[0]
         last = state.get("best_alert") or {}
         if s >= CFG["best_alert_score"] and (last.get("mint") != mint or NOW - last.get("ts", 0) > 3600):
-            state["best_alert"] = dict(mint=mint, ts=NOW)
             j = dict(verdict="BUY", score=s, reasons=["#1 on fomo by public stats: " + best_why(m, d)],
                      odds=odds_line(state, s), power=power_line())
-            msgs.append("🏆 <b>New #1 on fomo</b>\n" + card(mint, m, rk, j, tags.get(mint, [])))
-            record_call(state, mint, m, dict(j, verdict="BEST"))
+            if opp("🏆 <b>New #1 on fomo</b>\n" + card(mint, m, rk, j, tags.get(mint, []))):
+                state["best_alert"] = dict(mint=mint, ts=NOW)
+                record_call(state, mint, m, dict(j, verdict="BEST"))
+    hist_px = track_prices(state, pairs, [mi for mi, _ in live] + held_mints)
+    dip_seen = {k: v for k, v in state.get("dip_alerted", {}).items() if NOW - v < 86400}
+    for dd, mint, m, rk, hi in find_dips(hist_px, pairs, lambda mi: rugs.get(mi) or cached_rug(mi))[:3]:
+        if NOW - dip_seen.get(mint, 0) < 3 * 3600 or not can_buy:
+            continue
+        sc = momentum_score(m, rk)[0]
+        j = dict(verdict="BUY", score=sc, odds=odds_line(state, sc), power=power_line(), reasons=[
+            f"dip: {dd:.0%} off its 2h high of {px(hi)}, uptrend intact, buyers stepping back in"])
+        if opp("📉 <b>Dip on a strong coin</b>\n" + card(mint, m, rk, j, tags.get(mint, []))):
+            dip_seen[mint] = NOW
+            record_call(state, mint, m, dict(j, verdict="DIP"))
+    state["dip_alerted"] = dip_seen
     state["alerted"] = {k: v for k, v in state["alerted"].items() if NOW - v < 86400}
     state["last_judged"] = [dict(mint=mi, sym=m["symbol"], verdict=j["verdict"], score=j["score"],
                                  why="; ".join(j["reasons"])[:90], price=m["price"])
@@ -948,16 +1022,11 @@ def run():
         return (f"{tag} <b>${html.escape(m['symbol'])}</b> {px(m['price'])} · 1h {m['ch_h1']:+.0f}% · "
                 f"MC {usd(m['mcap'])}{extra}")
 
-    if state.get("menu_set") != 4:  # (re)send the command menu when it changes
+    if state.get("menu_set") != 5:  # (re)send the command menu when it changes
         tg("setMyCommands", commands=[dict(command=c, description=d) for c, d in (
-            ("best", "Best on fomo right now, ranked on public stats"),
-            ("buy", "What passes the checks and you can afford now"), ("fomo", "fomo's hottest coins right now"),
-            ("copy", "What the traders you follow just did"),
-            ("trending", "Trending coins with verdicts"),
-            ("gainers", "Biggest 1h movers (live, liquid)"), ("graduated", "Coins that just left pump.fun"),
-            ("balance", "Your buying power and positions"), ("positions", "Your open coins vs entry"),
-            ("stats", "How the bot's calls have done"))])
-        state["menu_set"] = 4
+            ("best", "Top coins on fomo right now"), ("positions", "Your coins, P&L and buying power"),
+            ("copy", "What the traders you follow did"), ("stats", "How the bot's calls have done"))])
+        state["menu_set"] = 5
 
     def answer(c):
         msgs = []
@@ -1014,14 +1083,16 @@ def run():
                 msgs.append(f"<b>Balance</b>\nStablecoins {usd(bp['stable'])} · SOL {bp['sol']:.4f} "
                             f"({usd(bp['sol_usd'])})\nIn coins: {usd(posv)} across {len(state['positions'])} "
                             f"position(s)\n{power_line()}")
-        elif c in ("/scan", "/trending", "/start", "/help"):
+        elif c in ("/scan", "/trending"):
             rows = sorted(state["last_judged"], key=lambda r: ({"BUY": 0, "WAIT": 1, "AVOID": 2}[r["verdict"]], -r["score"]))
             body = "\n".join(f"{icon[r['verdict']]} <b>${html.escape(r['sym'])}</b> {r['verdict']} {r['score']} · "
                              f"{html.escape(r['why'])}" for r in rows) or "Nothing passed the market filters this run."
             note = "" if can_buy else f"\n\n(BUY alerts paused: buying power under {usd(stake)}.)"
-            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /best /buy /fomo /copy /trending /gainers /graduated "
-                        f"/balance /positions /stats")
+            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /best /positions /copy /stats")
+        elif c == "/help":
+            msgs.append(HELP_TEXT)
         elif c == "/positions":
+            msgs += answer("/balance")
             if not state["positions"]:
                 msgs.append("No open positions seen in your wallet.")
             for mint, ps in state["positions"].items():
@@ -1034,8 +1105,18 @@ def run():
             msgs.append(stats_text(state))
         return msgs
 
-    snapshot = {c: answer(c) for c in ("/best", "/buy", "/fomo", "/copy", "/gainers", "/graduated", "/balance",
-                                       "/trending", "/positions", "/stats")}
+    snapshot = {c: answer(c) for c in ("/best", "/positions", "/copy", "/stats", "/help",  # menu + help
+                                       "/buy", "/fomo", "/gainers", "/graduated", "/balance", "/trending")}  # still work
+    if NOW - state.get("digest_ts", 0) >= CFG["digest_minutes"] * 60:
+        state["digest_ts"] = NOW
+        top = "\n".join(f"{i + 1}. <b>${html.escape(m['symbol'])}</b> {s}/100 · {html.escape(best_why(m, d))}"
+                        for i, (s, mi, m, rk, d) in enumerate(best[:3])) or "Nothing passes the checks right now."
+        pv = sum(p.get("value", 0) for p in state["positions"].values())
+        moves = sum(1 for e in state.get("copy_log", []) if NOW - e["ts"] < CFG["digest_minutes"] * 60)
+        msgs.append(f"🧾 <b>MemeScan update</b>\n<b>Top on fomo</b>\n{top}\n\n<b>You</b>: {len(state['positions'])} coin(s) "
+                    f"worth {usd(pv)}" + (f" · {power_line()}" if bp else "") +
+                    (f"\n<b>Copy</b>: {moves} trade(s) by followed traders" if COPY else "") +
+                    "\n/positions for details · /stats for the track record")
     try:
         tmp = os.path.join(STATE_DIR, "snapshot.json.tmp")
         with open(tmp, "w") as f:
@@ -1044,7 +1125,7 @@ def run():
     except OSError as e:
         log(f"snapshot write failed: {e}")
     for c in dict.fromkeys(cmds):
-        msgs += snapshot.get("/trending" if c in ("/scan", "/start", "/help") else c, [])
+        msgs += snapshot.get({"/start": "/help", "/scan": "/best"}.get(c, c), [])
 
     for t in msgs:
         send(state, t)
