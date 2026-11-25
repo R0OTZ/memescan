@@ -29,6 +29,8 @@ RC = "https://api.rugcheck.xyz/v1"
 FOMO = "https://prod-api.fomo.family/public/prices"  # the public feed behind fomo.family's market pages
 FOMO_SOLANA = 1399811149
 FOMO_META = {}  # mint -> fomo's own numbers for coins fomo lists
+COPY = [tuple(x.strip().split(":", 1)) for x in os.environ.get("COPY_WALLETS", "").split(",") if ":" in x]
+STATE_DIR = os.path.dirname(STATE_PATH) or "."
 UA = {"User-Agent": "Mozilla/5.0 (memescan)", "Accept": "application/json"}
 
 CFG = dict(
@@ -355,6 +357,50 @@ def entry_from_chain(owner, mint, sol_price):
     return cost / tokens_in if tokens_in > 0 else None
 
 
+def copy_watch(state, sol_price):
+    """New buys/sells by the wallets in COPY_WALLETS since the last run: (name, side, mint, usd_size)."""
+    seen, events = state.setdefault("copy", {}), []
+    for name, addr in COPY:
+        last = seen.get(addr)
+        opts = {"limit": 15}
+        if last:
+            opts["until"] = last
+        sigs = rpc("getSignaturesForAddress", [addr, opts])
+        if not sigs:
+            continue
+        seen[addr] = sigs[0]["signature"]
+        if not last:
+            continue  # first look at this wallet: start watching from now
+        for s in reversed(sigs):
+            if s.get("err"):
+                continue
+            tx = rpc("getTransaction", [s["signature"], {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+            if not tx:
+                continue
+            meta = tx.get("meta") or {}
+            pre, post = meta.get("preTokenBalances") or [], meta.get("postTokenBalances") or []
+
+            def bal(lst, m):
+                return sum(float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+                           for b in lst if b.get("owner") == addr and b.get("mint") == m)
+
+            keys = [k.get("pubkey") if isinstance(k, dict) else k
+                    for k in ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []]
+            dsol = 0.0
+            if addr in keys:
+                i = keys.index(addr)
+                try:
+                    dsol = (meta["preBalances"][i] - meta["postBalances"][i]) / 1e9
+                except (KeyError, IndexError, TypeError):
+                    pass
+            dusd = sum(bal(pre, q) - bal(post, q) for q in USD_STABLES) + (bal(pre, WSOL) - bal(post, WSOL) + dsol) * sol_price
+            for m in {b.get("mint") for b in pre + post if b.get("owner") == addr} - STABLES:
+                d = bal(post, m) - bal(pre, m)
+                if d:
+                    events.append((name, "BUY" if d > 0 else "SELL", m, abs(dusd)))
+    return events
+
+
 # ---------------------------------------------------------------- judging
 def market_gate(m):
     if m["price"] <= 0:
@@ -491,6 +537,15 @@ def send(state, text):
 
 
 def read_commands(state):
+    if os.environ.get("LISTENER"):  # listener.py owns Telegram input and answers instantly from the snapshot
+        try:
+            with open(os.path.join(STATE_DIR, "tg.json")) as f:
+                chat = json.load(f).get("chat_id")
+            if chat:
+                state["chat_id"] = chat
+        except Exception:
+            pass
+        return []
     r = tg("getUpdates", offset=state["tg_offset"] + 1, timeout=0)
     cmds = []
     for u in (r or {}).get("result") or []:
@@ -532,7 +587,7 @@ def stats_text(state):
     if not calls:
         return "No calls logged yet."
     out = [f"<b>Call log</b> ({len(calls)} calls since {time.strftime('%b %d', time.gmtime(calls[0]['ts']))})"]
-    for v in ("BUY", "WAIT", "AVOID"):
+    for v in ("BUY", "COPY", "WAIT", "AVOID"):
         cs = [c for c in calls if c["verdict"] == v]
         if not cs:
             continue
@@ -744,6 +799,33 @@ def run():
             others = ", ".join("$" + html.escape(b[2]["symbol"]) for b in buys[1:4])
             msgs.append(card(mint, m, rk, j, tags.get(mint, [])) +
                         (f"\nAlso qualifying (weaker): {others}" if others else ""))
+    if COPY:
+        events = copy_watch(state, sol_usd())
+        cp = pairs_for([e[2] for e in events]) if events else {}
+        log_ = state.setdefault("copy_log", [])
+        for name, side, mint, size in events:
+            p = cp.get(mint)
+            m = metrics(p) if p else None
+            sym = html.escape(m["symbol"]) if m else mint[:6]
+            log_.append(dict(ts=NOW, who=name, side=side, sym=m["symbol"] if m else mint[:6], usd=size))
+            if side == "SELL":
+                mine = mint in state["positions"]
+                msgs.append(f"👥 <b>{html.escape(name)} SOLD ${sym}</b> (~{usd(size)})"
+                            + ("\n⚠️ You hold this coin." if mine else ""))
+                continue
+            if not m:
+                msgs.append(f"👥 <b>{html.escape(name)} BOUGHT</b> <code>{html.escape(mint)}</code> (~{usd(size)})\n"
+                            "No market data yet: too new to check. Don't chase blind.")
+                continue
+            rk = cached_rug(mint)
+            if rk and not rk["ok"]:
+                j = dict(verdict="AVOID", score=0, reasons=["don't copy: " + "; ".join(rk["fails"])])
+            else:
+                j = dict(verdict="BUY" if rk else "WAIT", score=momentum_score(m, rk)[0] if rk else 0,
+                         reasons=[f"copying {name}" + ("" if rk else ": rug check unavailable, be careful")])
+                record_call(state, mint, m, dict(j, verdict="COPY"))
+            msgs.append(f"👥 <b>{html.escape(name)} BOUGHT ${sym}</b> (~{usd(size)})\n" + card(mint, m, rk, j, tags.get(mint, [])))
+        state["copy_log"] = log_[-30:]
     state["alerted"] = {k: v for k, v in state["alerted"].items() if NOW - v < 86400}
     state["last_judged"] = [dict(mint=mi, sym=m["symbol"], verdict=j["verdict"], score=j["score"],
                                  why="; ".join(j["reasons"])[:90], price=m["price"])
@@ -757,19 +839,28 @@ def run():
         return (f"{tag} <b>${html.escape(m['symbol'])}</b> {px(m['price'])} · 1h {m['ch_h1']:+.0f}% · "
                 f"MC {usd(m['mcap'])}{extra}")
 
-    if state.get("menu_set") is True:
-        state["menu_set"] = 1  # re-send the menu once so /fomo shows up
-    if not state.get("menu_set") or state.get("menu_set") == 1:
+    if state.get("menu_set") != 3:  # (re)send the command menu when it changes
         tg("setMyCommands", commands=[dict(command=c, description=d) for c, d in (
             ("buy", "What passes the checks and you can afford now"), ("fomo", "fomo's hottest coins right now"),
+            ("copy", "What the traders you follow just did"),
             ("trending", "Trending coins with verdicts"),
             ("gainers", "Biggest 1h movers (live, liquid)"), ("graduated", "Coins that just left pump.fun"),
             ("balance", "Your buying power and positions"), ("positions", "Your open coins vs entry"),
             ("stats", "How the bot's calls have done"))])
-        state["menu_set"] = 2
+        state["menu_set"] = 3
 
-    for c in dict.fromkeys(cmds):
-        if c == "/buy":
+    def answer(c):
+        msgs = []
+        if c == "/copy":
+            if not COPY:
+                msgs.append("No traders set up yet. Their wallet addresses go in COPY_WALLETS in the workflow.")
+            else:
+                ev = state.get("copy_log", [])[-10:]
+                msgs.append("<b>Traders you follow</b>: " + ", ".join(html.escape(n) for n, a in COPY) + "\n" + (
+                    "\n".join(f"{'🟢' if e['side'] == 'BUY' else '🔻'} {html.escape(e['who'])} {e['side']} "
+                              f"${html.escape(e['sym'])} ~{usd(e['usd'])} · {int((NOW - e['ts']) / 60)}m ago"
+                              for e in reversed(ev)) or "No trades seen yet."))
+        elif c == "/buy":
             bl = [(mi, m) for mi, m, rk, j in judged if j["verdict"] == "BUY"]
             body = "\n".join(row(mi, m, f" · score {verdicts[mi]['score']}") for mi, m in bl) or \
                 "Nothing passes the rug checks with buying momentum right now."
@@ -806,7 +897,7 @@ def run():
             body = "\n".join(f"{icon[r['verdict']]} <b>${html.escape(r['sym'])}</b> {r['verdict']} {r['score']} · "
                              f"{html.escape(r['why'])}" for r in rows) or "Nothing passed the market filters this run."
             note = "" if can_buy else f"\n\n(BUY alerts paused: buying power under {usd(stake)}.)"
-            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /buy /fomo /trending /gainers /graduated "
+            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /buy /fomo /copy /trending /gainers /graduated "
                         f"/balance /positions /stats")
         elif c == "/positions":
             if not state["positions"]:
@@ -819,6 +910,19 @@ def run():
                                 f"· value {usd(ps.get('value', 0))} · stop {px(ps['entry'] * (1 + CFG['stop_pct'] / 100))}")
         elif c == "/stats":
             msgs.append(stats_text(state))
+        return msgs
+
+    snapshot = {c: answer(c) for c in ("/buy", "/fomo", "/copy", "/gainers", "/graduated", "/balance",
+                                       "/trending", "/positions", "/stats")}
+    try:
+        tmp = os.path.join(STATE_DIR, "snapshot.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(dict(ts=NOW, cmds=snapshot), f)
+        os.replace(tmp, os.path.join(STATE_DIR, "snapshot.json"))
+    except OSError as e:
+        log(f"snapshot write failed: {e}")
+    for c in dict.fromkeys(cmds):
+        msgs += snapshot.get("/trending" if c in ("/scan", "/start", "/help") else c, [])
 
     for t in msgs:
         send(state, t)
