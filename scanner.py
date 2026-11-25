@@ -26,6 +26,9 @@ RPCS = [SOL_RPC, "https://solana-rpc.publicnode.com"]  # free public endpoints, 
 DS = "https://api.dexscreener.com"
 GT = "https://api.geckoterminal.com/api/v2"
 RC = "https://api.rugcheck.xyz/v1"
+FOMO = "https://prod-api.fomo.family/public/prices"  # the public feed behind fomo.family's market pages
+FOMO_SOLANA = 1399811149
+FOMO_META = {}  # mint -> fomo's own numbers for coins fomo lists
 UA = {"User-Agent": "Mozilla/5.0 (memescan)", "Accept": "application/json"}
 
 CFG = dict(
@@ -138,6 +141,25 @@ def discover():
             order.append(mint)
         if tag not in seen[mint]:
             seen[mint].append(tag)
+
+    fj = get_json(FOMO)
+    toks = ((fj.get("responseObject") or {}).get("tokens") or []) if isinstance(fj, dict) else []
+    for t in toks:
+        al, md = t.get("allowlist") or {}, t.get("marketData") or {}
+        if al.get("networkId") != FOMO_SOLANA or not al.get("tokenAddress"):
+            continue
+
+        def num(k):
+            try:
+                return float(md.get(k) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        FOMO_META[al["tokenAddress"]] = dict(
+            vol1=num("volume1"), ch1=num("change1") * 100, holders=md.get("holders"),
+            x=(((md.get("token") or {}).get("socialLinks") or {}).get("twitter")))
+    for i, mint in enumerate(sorted(FOMO_META, key=lambda k: -FOMO_META[k]["vol1"])):
+        add(mint, "fomo hot" if i < 15 and FOMO_META[mint]["vol1"] > 0 else "fomo")
 
     for path, tag in (("/token-boosts/top/v1", "boosted"),
                       ("/token-boosts/latest/v1", "boosted"),
@@ -440,6 +462,12 @@ def card(mint, m, rk, j, tags):
         lines.append(f"Entry: wait for {px(j['target'])}. I'll ping you if it gets there and still looks safe.")
     if "boosted" in tags:
         lines.append("Note: trending partly because someone paid DexScreener to boost it.")
+    fm = FOMO_META.get(mint)
+    if fm:
+        lines.append(f"On fomo ✅ · fomo 1h vol {usd(fm['vol1'])} · holders {fm['holders'] or '?'}"
+                     + (f" · X: {e(fm['x'])}" if fm.get("x") else ""))
+    else:
+        lines.append("Not on fomo's market list: search the address in fomo to trade it.")
     lines.append(f"<code>{e(mint)}</code>")
     if m["url"]:
         lines.append(e(m["url"]))
@@ -595,7 +623,7 @@ def check_positions(state, held, pairs, rugs, owner=""):
 
 # ---------------------------------------------------------------- main
 def run():
-    BAL.clear(); ACCTS.clear(); _SOLP.clear()
+    BAL.clear(); ACCTS.clear(); _SOLP.clear(); FOMO_META.clear()
     state = load_state()
     cmds = read_commands(state)
     if not (os.environ.get("TELEGRAM_CHAT_ID") or state.get("chat_id")):
@@ -631,7 +659,8 @@ def run():
             judged.append((mint, m, None, dict(verdict=gate, score=0, reasons=why)))
             continue
         pending.append((mint, m))
-    pending.sort(key=lambda x: -(x[1]["vol_h1"] / max(x[1]["liq"], 1)))
+    pending.sort(key=lambda x: (0 if "fomo hot" in tags.get(x[0], []) else 1,  # fomo's hottest always get checked
+                                -(x[1]["vol_h1"] / max(x[1]["liq"], 1))))
     must_check = [k for k in dict.fromkeys(held_mints + list(state["watch"])) if k in pairs]
     rc_cache = {k: v for k, v in state.get("rc_cache", {}).items() if NOW - v[0] < 600}
     state["rc_cache"] = rc_cache  # reuse a coin's rug check for 10 min (your holdings are always re-checked)
@@ -728,13 +757,16 @@ def run():
         return (f"{tag} <b>${html.escape(m['symbol'])}</b> {px(m['price'])} · 1h {m['ch_h1']:+.0f}% · "
                 f"MC {usd(m['mcap'])}{extra}")
 
-    if not state.get("menu_set"):
+    if state.get("menu_set") is True:
+        state["menu_set"] = 1  # re-send the menu once so /fomo shows up
+    if not state.get("menu_set") or state.get("menu_set") == 1:
         tg("setMyCommands", commands=[dict(command=c, description=d) for c, d in (
-            ("buy", "What passes the checks and you can afford now"), ("trending", "Trending coins with verdicts"),
+            ("buy", "What passes the checks and you can afford now"), ("fomo", "fomo's hottest coins right now"),
+            ("trending", "Trending coins with verdicts"),
             ("gainers", "Biggest 1h movers (live, liquid)"), ("graduated", "Coins that just left pump.fun"),
             ("balance", "Your buying power and positions"), ("positions", "Your open coins vs entry"),
             ("stats", "How the bot's calls have done"))])
-        state["menu_set"] = True
+        state["menu_set"] = 2
 
     for c in dict.fromkeys(cmds):
         if c == "/buy":
@@ -744,6 +776,11 @@ def run():
             pl = power_line()
             msgs.append(f"<b>Passing checks now</b>\n{body}" + (f"\n\n{pl}" if pl else "") +
                         "\nUnproven signals: see /stats before trusting them.")
+        elif c == "/fomo":
+            hot = sorted((mi for mi in FOMO_META if mi in pairs), key=lambda k: -FOMO_META[k]["vol1"])[:12]
+            msgs.append("<b>fomo's hottest right now</b> (by 1h volume on fomo's list)\n" + ("\n".join(
+                row(mi, metrics(pairs[mi]), f" · fomo vol {usd(FOMO_META[mi]['vol1'])}") for mi in hot)
+                or "Couldn't load fomo's list this run."))
         elif c == "/gainers":
             top = sorted(live, key=lambda x: -x[1]["ch_h1"])[:10]
             msgs.append("<b>Top 1h gainers</b> (liquid, active)\n" +
@@ -769,7 +806,7 @@ def run():
             body = "\n".join(f"{icon[r['verdict']]} <b>${html.escape(r['sym'])}</b> {r['verdict']} {r['score']} · "
                              f"{html.escape(r['why'])}" for r in rows) or "Nothing passed the market filters this run."
             note = "" if can_buy else f"\n\n(BUY alerts paused: buying power under {usd(stake)}.)"
-            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /buy /trending /gainers /graduated "
+            msgs.append(f"<b>Trending scan</b>\n{body}{note}\n\nCommands: /buy /fomo /trending /gainers /graduated "
                         f"/balance /positions /stats")
         elif c == "/positions":
             if not state["positions"]:
