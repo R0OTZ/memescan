@@ -14,7 +14,7 @@ import urllib.request
 STATE_DIR = os.path.dirname(os.environ.get("STATE_PATH", "state/state_v2.json")) or "."
 TG_PATH = os.path.join(STATE_DIR, "tg.json")
 SNAP_PATH = os.path.join(STATE_DIR, "snapshot.json")
-HELP = "Commands: /best /buy /fomo /copy /trending /gainers /graduated /balance /positions /stats"
+HELP = "Commands: /best /positions /copy /stats /help"
 
 
 def call(method, params, timeout=40):
@@ -60,7 +60,7 @@ def handle(st, u, send):
     if not chat or str(chat) != str(owner) or not text.startswith("/"):
         return
     cmd = text.split()[0].split("@")[0].lower()
-    key = "/trending" if cmd in ("/scan", "/start", "/help") else cmd
+    key = {"/start": "/help", "/scan": "/best"}.get(cmd, cmd)
     snap = load(SNAP_PATH, {})
     replies = (snap.get("cmds") or {}).get(key)
     if replies is None:
