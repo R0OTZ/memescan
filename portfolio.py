@@ -70,7 +70,7 @@ def sync(pf, owner, rpc, stables, budget=40):
         sig = pf["pending"].pop(0)
         if sig in pf["events"]:
             continue
-        tx = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+        tx = rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}])
         done += 1
         if tx is None:
             pf["pending"].append(sig)  # retry later
