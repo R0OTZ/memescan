@@ -1,7 +1,7 @@
 name: scan
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 min (GitHub may run it late when busy)
+    - cron: "3-59/10 * * * *"   # every 10 min, off the busy :00 mark (GitHub may still run it late)
   workflow_dispatch: {}      # "Run workflow" button for a manual scan
 concurrency:
   group: scan
