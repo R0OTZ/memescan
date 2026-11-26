@@ -135,24 +135,30 @@ def run(cache=None, history=None, weights=None, gather_result=None):
                 took=time.time() - t0, tags=tags, market_src=T.meta(ds))
 
 
+REJECT_SHORT = {"no trading pair": "no market", "market cap outside range": "too big/small",
+                "no trades in the last 5 min (stale)": "no recent trades", "fewer than 30 trades in 1h": "too quiet",
+                "ranked below the top 10 on market data": "weaker numbers", "failed security (disqualified)": "failed safety"}
+
+
 def fmt(res):
-    """Telegram messages for /best."""
+    """Telegram messages for /best: a short header, then one short card per coin."""
     shown = res["shown"]
-    head = (f"🏆 <b>Best right now</b> · {T.clock(res['t'])}\n"
-            f"Checked {res['n']} live candidates (fomo trending/gainers, graduations, GeckoTerminal trending, "
-            f"DexScreener boosts/new) → {len(res['ranked'])} fully analyzed → {len(shown)} qualify.")
-    rej = "\n".join(f"• {html.escape(k)}: {v}" for k, v in sorted(res["rejected"].items(), key=lambda kv: -kv[1]))
+    rej = res["rejected"]
+    skipped = ", ".join(f"{v} {REJECT_SHORT.get(k, 'low liquidity' if 'liquidity' in k else 'weak score' if 'score' in k else 'dropped on re-check' if 're-check' in k else k)}"
+                        for k, v in sorted(rej.items(), key=lambda kv: -kv[1])[:4])
+    head = (f"🏆 <b>Best right now</b> · {T.hm(res['t'])}\n"
+            f"Checked {res['n']} coins → {len(shown)} pass" + (f"\nSkipped: {skipped}" if skipped else ""))
     down = [k for k, v in res["src"].items() if not v["ok"]]
     if down:
-        head += "\nSources down this pass: " + html.escape(", ".join(down))
+        head += "\n⚠️ Some sources were down: " + html.escape(", ".join(down))
+    head += "\n<i>Not included: X/Twitter buzz, Bubblemaps, Thesis (no free data). Scores aren't promises.</i>"
     if not shown:
         near = [a for a in res["ranked"] if not a["disqualified"]][:3]
         tail = ("\nClosest: " + ", ".join(f"${html.escape(a['market']['symbol'])} {a['score']}" for a in near)) if near else ""
-        return [head + "\n\n<b>Nothing meets the quality bar right now.</b> I won't pad the list with weak picks."
-                f"\nWhy candidates were dropped:\n{rej}{tail}"]
-    msgs = [head + "\n\nDropped:\n" + rej + "\n\n<i>Ranked by evidence, not a promise of gains.</i>"]
+        return [head + "\n\n<b>Nothing is good enough right now.</b> I won't pad the list with weak coins." + tail]
+    msgs = [head]
     for i, a in enumerate(shown, 1):
-        msgs.append(T.fmt_best_item(i, a) + ("\nFound via: " + html.escape(", ".join(a.get("tags") or [])) if a.get("tags") else ""))
+        msgs.append(T.fmt_best_item(i, a) + ("\n📍 Found via " + html.escape(", ".join(a.get("tags") or [])) if a.get("tags") else ""))
     return msgs
 
 
