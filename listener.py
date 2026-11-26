@@ -72,9 +72,9 @@ def live_best(send, owner):
     if dropped:
         res["rejected"][f"dropped out on the live re-check just now"] = dropped
     msgs = D.fmt(res)
-    note = f"\n<i>Candidate scan {T.ago(age)} ago; prices and security re-checked now.</i>"
+    note = "\n<i>Prices re-checked just now.</i>"
     if age > 600:
-        note += "\n⚠️ The background scan is behind; candidates may be missing newer coins."
+        note += f"\n⚠️ Coin list is {T.ago(age)} old: the background scan is behind."
     msgs[0] += note
     for t in msgs:
         send(owner, t)
