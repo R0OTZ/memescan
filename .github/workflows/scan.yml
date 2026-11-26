@@ -21,10 +21,11 @@ jobs:
           path: state
           key: state-${{ github.run_id }}
           restore-keys: state-
-      - name: Scan about once a minute for 55 minutes, answer Telegram instantly
+      - name: Scan, watch and answer Telegram for 55 minutes
         run: |
           end=$((SECONDS + 55*60))
           python3 listener.py $((55*60)) &   # replies to your commands within seconds
+          python3 watcher.py $((55*60)) &    # /watch every 10s, copy-watch every 15s, /best discovery every 2 min
           while [ $SECONDS -lt $end ]; do
             git pull -q --ff-only origin main || true   # pick up code updates without a restart
             python3 scanner.py || echo "scan failed, retrying next cycle"
@@ -37,7 +38,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WALLET: ${{ secrets.WALLET }}
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}   # optional free key: faster, steadier Solana data
           STAKE_USD: "2"
+          WATCH_INTERVAL: "10"
       - name: Save bot memory
         if: always()
         uses: actions/cache/save@v4
