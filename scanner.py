@@ -21,8 +21,12 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
+import discovery as DISC
 import market_intel as MI
+import notify
 import portfolio as PF
+import providers as P
+import token_intel as T
 
 STATE_PATH = os.environ.get("STATE_PATH", "state/state_v2.json")
 SOL_RPC = os.environ.get("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
@@ -637,12 +641,7 @@ def find_dips(hist, pairs, rug_for):
     return sorted(out, key=lambda x: -x[0])
 
 
-HELP_TEXT = ("<b>MemeScan</b>\n/summary: trending coin intelligence (add a number, e.g. /summary 2, for a full breakdown)\n"
-             "/stats: your balance, P&amp;L, holdings, history and risk\n/best: top coins on fomo right now\n"
-             "/copy: what the traders you follow did\nAlso: /positions, /calls (how the bot's own calls did)\n\n"
-             "<b>Automatic alerts</b> (no command needed)\n🏆 new #1 on fomo · 🟢 buy setups · 📉 dips on strong coins\n"
-             "👥 copy trades · 🚨 sell / stop / take-profit on your coins · 🧾 summary every 2h\n"
-             "Buy-type alerts are capped at 6 per hour.")
+HELP_TEXT = "Send /help for the command list."
 
 
 # ---------------------------------------------------------------- formatting
@@ -857,7 +856,27 @@ def stats_text(state):
         out.append(f"Paper P&L if you took every resolved BUY at ${stake:.0f}: ${pnl:+.2f} "
                    f"(before fees/slippage)")
     out.append("Rule of thumb: don't trust this until there are 30+ resolved BUYs.")
+    out.append(T_weights_report(calls))
     return "\n".join(out)
+
+
+def T_weights_report(calls):
+    """Weight test on the bot's own /best history: for each scoring category, do picks that scored high in it
+    do better (best price within 24h vs the price at the pick) than picks that scored low?"""
+    done = [c for c in calls if c["verdict"] == "BEST" and c.get("cats") and (NOW - c["ts"] > 86400 or c["hit"])]
+    if len(done) < 20:
+        return f"Weight test: {len(done)}/20 resolved /best picks so far; results appear once there are 20."
+    rows = []
+    for k in T.DEFAULT_WEIGHTS:
+        xs = [(c["cats"].get(k), c["max"] / c["price"] - 1) for c in done if c["cats"].get(k) is not None and c["price"]]
+        if len(xs) < 10:
+            continue
+        xs.sort()
+        lo, hi = xs[:len(xs) // 2], xs[len(xs) // 2:]
+        avg = lambda v: sum(r for _, r in v) / len(v) * 100
+        rows.append(f"{k}: high half peak {avg(hi):+.0f}% vs low half {avg(lo):+.0f}%")
+    return ("<b>Weight test</b> ({} resolved picks; a category earns its weight if its high half does better)\n".format(len(done))
+            + "\n".join(rows) + "\nAdjust with a weights.json in the state folder or the MEMESCAN_WEIGHTS setting.")
 
 
 # ---------------------------------------------------------------- positions
@@ -889,11 +908,13 @@ def check_positions(state, held, pairs, rugs, owner=""):
             if real:
                 ps["entry"], ps["src"] = real, "chain"
                 ps["peak"] = max(m["price"], real)
-        if "announced" not in ps:
-            ps["announced"] = True
+        ann = state.setdefault("announced", {})
+        if "announced" not in ps and NOW - ann.get(mint, 0) > 7 * 86400:  # once per coin per week, not every re-detect
+            ann[mint] = NOW
             how = "from your buy transactions" if ps.get("src") == "chain" else "estimate: price when first seen"
             ps["value"] = value
-            alerts.append("👀 <b>Now watching</b>\n" + pos_text(ps, m))
+            alerts.append("👀 <b>Now tracking your position</b>\n" + pos_text(ps, m))
+        ps["announced"] = True
         ps["peak"] = max(ps["peak"], m["price"])
         ps["value"] = value
         chg = (m["price"] / ps["entry"] - 1) * 100
@@ -924,9 +945,28 @@ def check_positions(state, held, pairs, rugs, owner=""):
 
 
 # ---------------------------------------------------------------- main
+def ensure_watcher():
+    """Start watcher.py (10s /watch, copy-watch, /best discovery) if it isn't running: its lock file carries a
+    heartbeat, so this never starts a second copy and restarts it within a minute if it ever dies."""
+    if not os.environ.get("LISTENER"):
+        return
+    try:
+        with open(os.path.join(STATE_DIR, "watcher.lock")) as f:
+            if time.time() - json.load(f).get("hb", 0) < 40:
+                return
+    except Exception:
+        pass
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    subprocess.Popen([sys.executable, os.path.join(here, "watcher.py"), "900"], cwd=os.getcwd(),
+                     stdout=sys.stdout, stderr=sys.stderr, start_new_session=True)
+    log("started watcher.py")
+
+
 def run():
     BAL.clear(); ACCTS.clear(); _SOLP.clear(); FOMO_META.clear(); RPC_FAILS.clear()
     state = load_state()
+    ensure_watcher()
     cmds = read_commands(state)
     if not (os.environ.get("TELEGRAM_CHAT_ID") or state.get("chat_id")):
         # nobody to alert yet: don't scan, or alerts would be marked sent while going nowhere
@@ -985,10 +1025,10 @@ def run():
         rugs[mint] = rk
         judged.append((mint, m, rk, judge(m, rk)))
 
-    msgs = []
+    msgs = []  # (category, text): categories are notify.CATS, or 'reply' for command answers
     # positions first: exits matter more than entries
     if held_ok:
-        msgs += check_positions(state, held, pairs, rugs, wallet)
+        msgs += [("positions", t) for t in check_positions(state, held, pairs, rugs, wallet)]
     holding = any(p.get("value", 0) >= 1 for p in state["positions"].values())
     bp = buying_power(wallet) if held_ok else None
     stake = CFG["stake_usd"]
@@ -1007,7 +1047,7 @@ def run():
         if len(times) >= CFG["max_opps_per_hour"]:
             return False
         state["opp_times"] = times + [NOW]
-        msgs.append(text)
+        msgs.append(("discovery", text))
         return True
 
     buys = []  # (rank, mint, m, rk, j): your stake covers ONE position, so only the best gets a card
@@ -1054,43 +1094,31 @@ def run():
             others = ", ".join("$" + html.escape(b[2]["symbol"]) for b in buys[1:4])
             opp(card(mint, m, rk, j, tags.get(mint, [])) +
                 (f"\nAlso qualifying (weaker): {others}" if others else ""))
-    if COPY:
-        events = copy_watch(state, sol_usd())
-        cp = pairs_for([e[2] for e in events]) if events else {}
-        log_ = state.setdefault("copy_log", [])
-        for name, side, mint, size in events:
-            p = cp.get(mint)
-            m = metrics(p) if p else None
-            sym = html.escape(m["symbol"]) if m else mint[:6]
-            log_.append(dict(ts=NOW, who=name, side=side, sym=m["symbol"] if m else mint[:6], usd=size))
-            if side == "SELL":
-                mine = mint in state["positions"]
-                msgs.append(f"👥 <b>{html.escape(name)} SOLD ${sym}</b> (~{usd(size)})"
-                            + ("\n⚠️ You hold this coin." if mine else ""))
-                continue
-            if not m:
-                msgs.append(f"👥 <b>{html.escape(name)} BOUGHT</b> <code>{html.escape(mint)}</code> (~{usd(size)})\n"
-                            "No market data yet: too new to check. Don't chase blind.")
-                continue
-            rk = cached_rug(mint)
-            if rk and not rk["ok"]:
-                j = dict(verdict="AVOID", score=0, reasons=["don't copy: " + "; ".join(rk["fails"])])
-            else:
-                j = dict(verdict="BUY" if rk else "WAIT", score=momentum_score(m, rk)[0] if rk else 0,
-                         reasons=[f"copying {name}" + ("" if rk else ": rug check unavailable, be careful")])
-                record_call(state, mint, m, dict(j, verdict="COPY"))
-            msgs.append(f"👥 <b>{html.escape(name)} BOUGHT ${sym}</b> (~{usd(size)})\n" + card(mint, m, rk, j, tags.get(mint, [])))
-        state["copy_log"] = log_[-30:]
-    best = fomo_rank(state, pairs, lambda mi: rugs.get(mi) or cached_rug(mi))
-    if best:
-        s, mint, m, rk, d = best[0]
-        last = state.get("best_alert") or {}
-        if s >= CFG["best_alert_score"] and (last.get("mint") != mint or NOW - last.get("ts", 0) > 3600):
-            j = dict(verdict="BUY", score=s, reasons=["#1 on fomo by public stats: " + best_why(m, d)],
-                     odds=odds_line(state, s), power=power_line())
-            if opp("🏆 <b>New #1 on fomo</b>\n" + card(mint, m, rk, j, tags.get(mint, []))):
-                state["best_alert"] = dict(mint=mint, ts=NOW)
-                record_call(state, mint, m, dict(j, verdict="BEST"))
+    # copy-watch / copy-trade moved to copytrade.py (runs every 15s inside watcher.py)
+    # ---------------------------------------------------------------- /best: live discovery + evidence scoring
+    # discovery runs every 2 min in watcher.py (its own thread) and writes best.json; here we only grade and alert
+    try:
+        with open(os.path.join(STATE_DIR, "best.json")) as f:
+            bc = json.load(f)
+    except Exception:
+        bc = {}
+    bc["top"] = [dict(sym=x["sym"], score=x["score"], verdict=x["verdict"]) for x in (bc.get("shown") or [])[:3]]
+    if bc.get("t") and bc["t"] > state.get("best_seen_t", 0):
+        state["best_seen_t"] = bc["t"]
+        nset = notify.load()
+        seen = {k: v for k, v in state.get("best_logged", {}).items() if NOW - v < 6 * 3600}
+        dal = {k: v for k, v in state.get("disc_alerted", {}).items() if NOW - v < 86400}
+        for x in bc.get("shown") or []:
+            if x["mint"] not in seen:  # graded later in /calls, per category, to test the weights
+                seen[x["mint"]] = NOW
+                state["calls"].append(dict(ts=NOW, mint=x["mint"], sym=x["sym"], verdict="BEST", price=x["price"],
+                                           score=x["score"], max=x["price"], min=x["price"], last=x["price"], hit=None,
+                                           cats=x["cats"]))
+            if (x["verdict"] == T.VERDICTS[0] and x["score"] >= nset["discovery_min_score"]
+                    and NOW - dal.get(x["mint"], 0) > 3 * 3600 and NOW - bc["t"] < 300):
+                if opp("🔬 <b>New research candidate</b> (meets your discovery criteria)\n" + x["text"]):
+                    dal[x["mint"]] = NOW
+        state["best_logged"], state["disc_alerted"] = seen, dal
     hist_px = track_prices(state, pairs, [mi for mi, _ in live] + held_mints)
     dip_seen = {k: v for k, v in state.get("dip_alerted", {}).items() if NOW - v < 86400}
     for dd, mint, m, rk, hi in find_dips(hist_px, pairs, lambda mi: rugs.get(mi) or cached_rug(mi))[:3]:
@@ -1200,8 +1228,8 @@ def run():
                 continue
             akeys[k] = NOW
             pal.append(dict(ts=NOW, sym=mm["symbol"], text=text))
-            msgs.append(f"⚠️ <b>${html.escape(mm['symbol'])}</b> · {stamp}\n{html.escape(text)}\n"
-                        f"<i>{ALERT_WHY[key]}</i>\n{html.escape(mm['url'])}")
+            msgs.append(("positions", f"⚠️ <b>${html.escape(mm['symbol'])}</b> · {stamp}\n{html.escape(text)}\n"
+                        f"<i>{ALERT_WHY[key]}</i>\n<code>{mint}</code>"))
     pfs["alerts"], pfs["alert_keys"] = pal[-50:], akeys
 
     if wallet and held_ok:
@@ -1262,35 +1290,22 @@ def run():
         return (f"{tag} <b>${html.escape(m['symbol'])}</b> {px(m['price'])} · 1h {m['ch_h1']:+.0f}% · "
                 f"MC {usd(m['mcap'])}{extra}")
 
-    if state.get("menu_set") != 6:  # (re)send the command menu when it changes
+    if state.get("menu_set") != 7:  # (re)send the command menu when it changes
         tg("setMyCommands", commands=[dict(command=c, description=d) for c, d in (
-            ("summary", "Trending coin intelligence report"), ("stats", "Your portfolio and trading performance"),
-            ("best", "Top coins on fomo right now"), ("copy", "What the traders you follow did"))])
-        state["menu_set"] = 6
+            ("best", "Strongest current opportunities"), ("token", "Full report: /token <address>"),
+            ("rugcheck", "Rug-pull risk: /rugcheck <address>"), ("watch", "Monitor a token every 10s"),
+            ("watchlist", "Tokens you're watching"), ("summary", "Trending coin intelligence"),
+            ("stats", "Your portfolio and performance"), ("copytrade", "Copy-trade panel (simulated)"),
+            ("copywatch", "Traders you track"), ("notifications", "Background alerts on/off"),
+            ("help", "All commands"))])
+        state["menu_set"] = 7
 
     def answer(c):
         msgs = []
         if c == "/best":
-            if not best:
-                msgs.append("Nothing on fomo's list passes the rug check and filters right now.")
-            else:
-                rows_ = [f"{i + 1}. <b>${html.escape(m['symbol'])}</b> {s}/100 · {px(m['price'])} · MC {usd(m['mcap'])}\n"
-                         f"    {html.escape(best_why(m, d))}" for i, (s, mi, m, rk, d) in enumerate(best[:5])]
-                warm = "" if any(d["g"] is not None for *_, d in best) else \
-                    "\n(Holder growth kicks in after ~15 min of history.)"
-                top = best[0][1]
-                msgs.append("🏆 <b>Best on fomo right now</b> (public stats, rug-checked)\n" + "\n".join(rows_) +
-                            f"\n\n#1 address: <code>{html.escape(top)}</code>{warm}\n"
-                            "Ranked by rules, not a promise. /stats grades the #1 picks (BEST).")
+            msgs += bc.get("msgs") or ["First /best pass hasn't finished yet."]
         elif c == "/copy":
-            if not COPY:
-                msgs.append("No traders set up yet. Their wallet addresses go in COPY_WALLETS in the workflow.")
-            else:
-                ev = state.get("copy_log", [])[-10:]
-                msgs.append("<b>Traders you follow</b>: " + ", ".join(html.escape(n) for n, a in COPY) + "\n" + (
-                    "\n".join(f"{'🟢' if e['side'] == 'BUY' else '🔻'} {html.escape(e['who'])} {e['side']} "
-                              f"${html.escape(e['sym'])} ~{usd(e['usd'])} · {int((NOW - e['ts']) / 60)}m ago"
-                              for e in reversed(ev)) or "No trades seen yet."))
+            msgs.append("Trader tracking moved to /copywatch, and copy trading to /copytrade.")
         elif c == "/buy":
             bl = [(mi, m) for mi, m, rk, j in judged if j["verdict"] == "BUY"]
             body = "\n".join(row(mi, m, f" · score {verdicts[mi]['score']}") for mi, m in bl) or \
@@ -1360,14 +1375,12 @@ def run():
         snapshot[f"/summary#{k}"] = [v]
     if NOW - state.get("digest_ts", 0) >= CFG["digest_minutes"] * 60:
         state["digest_ts"] = NOW
-        top = "\n".join(f"{i + 1}. <b>${html.escape(m['symbol'])}</b> {s}/100 · {html.escape(best_why(m, d))}"
-                        for i, (s, mi, m, rk, d) in enumerate(best[:3])) or "Nothing passes the checks right now."
+        top = "\n".join(f"{i + 1}. <b>${html.escape(x['sym'])}</b> {x['score']}/100 · {x['verdict']}"
+                        for i, x in enumerate(bc.get("top") or [])) or "Nothing meets the quality bar right now."
         pv = sum(p.get("value", 0) for p in state["positions"].values())
-        moves = sum(1 for e in state.get("copy_log", []) if NOW - e["ts"] < CFG["digest_minutes"] * 60)
-        msgs.append(f"🧾 <b>MemeScan update</b>\n<b>Top on fomo</b>\n{top}\n\n<b>You</b>: {len(state['positions'])} coin(s) "
+        msgs.append(("digest", f"🧾 <b>MemeScan update</b>\n<b>Best right now</b>\n{top}\n\n<b>You</b>: {len(state['positions'])} coin(s) "
                     f"worth {usd(pv)}" + (f" · {power_line()}" if bp else "") +
-                    (f"\n<b>Copy</b>: {moves} trade(s) by followed traders" if COPY else "") +
-                    "\n/positions for details · /stats for the track record")
+                    "\n/best for details · /stats for your record · /notifications off digest to stop these"))
     try:
         tmp = os.path.join(STATE_DIR, "snapshot.json.tmp")
         with open(tmp, "w") as f:
@@ -1376,11 +1389,16 @@ def run():
     except OSError as e:
         log(f"snapshot write failed: {e}")
     for c in dict.fromkeys(cmds):
-        msgs += snapshot.get({"/start": "/help", "/scan": "/best"}.get(c, c), [])
+        msgs += [("reply", t) for t in snapshot.get({"/start": "/help", "/scan": "/best"}.get(c, c), [])]
 
-    for t in msgs:
-        send(state, t)
-        time.sleep(0.4)
+    gate, nset = notify.Gate("scanner"), notify.load()
+    for cat, t in msgs:
+        # command replies always go out; background alerts only if that notification type is on (and under the cap)
+        if cat == "reply" or gate.allow(cat, f"{cat}:{hash(t)}", cooldown_min=0, settings=nset,
+                                        capped=cat != "positions"):
+            send(state, t)
+            time.sleep(0.4)
+    gate.save()
     save_state(state)
     log(f"run ok: {len(order)} discovered, {len(judged)} judged, {len(rugs)} rug-checked, "
         f"{len(msgs)} messages, positions={len(state['positions'])}")
