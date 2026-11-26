@@ -84,6 +84,10 @@ def clock(ts):
     return datetime.fromtimestamp(ts, TZ).strftime("%I:%M:%S %p ET").lstrip("0")
 
 
+def hm(ts):
+    return datetime.fromtimestamp(ts, TZ).strftime("%I:%M %p").lstrip("0")
+
+
 def when(ts):
     d = datetime.fromtimestamp(ts, TZ)
     today = datetime.now(TZ).date()
@@ -749,34 +753,105 @@ def social_line(mk):
         ". Mentions, sentiment and influencer activity: unavailable (no free X data)."
 
 
+RISK_WORD = {"Lower detected risk": "low", "Some concerns": "some concerns", "Elevated risk": "elevated",
+             "High risk": "high", "Critical risk indicators": "critical"}
+SHORT_VERDICT = {VERDICTS[0]: "Strong setup", VERDICTS[1]: "Worth watching", VERDICTS[2]: "Unclear",
+                 VERDICTS[3]: "Avoid"}
+
+
+def kfmt(n):
+    """159303 -> 159k, 1250 -> 1.3k"""
+    if n is None:
+        return "?"
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e4 else f"{n / 1e3:.1f}k" if n >= 1e3 else str(n)
+
+
+def short_reasons(a):
+    """Plain-language pros and cons, most important first."""
+    mk, hd, tf = a["market"] or {}, a["holders"] or {}, a["trades"]
+    pro, con = [], []
+    br = mk.get("br_h1")
+    if br is not None and br >= 0.55:
+        pro.append("buyers in control")
+    elif br is not None and br < 0.45:
+        con.append("sellers in control")
+    if (mk.get("accel") or 0) >= 1.5:
+        pro.append("volume picking up")
+    elif mk.get("accel") is not None and mk["accel"] < 0.5 and mk.get("vol_h1", 0) > 2000:
+        con.append("volume fading")
+    if mk.get("liq", 0) >= 50000:
+        pro.append("deep liquidity")
+    elif mk.get("liq", 0) < 15000:
+        con.append("thin liquidity")
+    if hd:
+        if hd["top10"] <= 25:
+            pro.append("holders spread out")
+        elif hd["top10"] > 30:
+            con.append(f"top 10 wallets own {hd['top10']:.0f}%")
+        if (hd.get("holders_chg") or 0) > 1:
+            pro.append("holder count growing")
+        if (hd.get("dev_pct") or 0) > 3:
+            con.append(f"dev still holds {hd['dev_pct']:.0f}%")
+        if hd["insider_pct"] >= 10:
+            con.append(f"insiders own {hd['insider_pct']:.0f}%")
+    if tf:
+        (pro if tf["net_usd"] > 0 else con).append("more money buying than selling" if tf["net_usd"] > 0
+                                                    else "more money selling than buying")
+        if tf["wash_share"] >= 0.15:
+            con.append("fake-looking volume")
+    if mk.get("ch_h24", 0) < -40:
+        con.append(f"crashed {abs(mk['ch_h24']):.0f}% in 24h")
+    if mk.get("ch_h1", 0) > 120 or mk.get("ch_h24", 0) > 400:
+        con.append("already pumped a lot: late entry")
+    if mk.get("tx_m5") == 0:
+        con.append("no trades in the last 5 min")
+    for f in a["findings"]:
+        if "transfer tax" in f["text"]:
+            con.append(f["text"].replace("transfer tax ", "").replace(" on every transfer", " tax on every trade"))
+    return pro, con
+
+
+def biggest_risk(a):
+    mk, hd = a["market"] or {}, a["holders"] or {}
+    crit = [f["text"] for f in a["findings"] if f["sev"] == "critical"]
+    if crit:
+        return crit[0]
+    if hd and hd.get("cluster_pct", 0) >= 5:
+        return f"linked wallets own {hd['cluster_pct']:.0f}%; if they sell together, price could crash"
+    if hd and hd.get("largest", 0) >= 3:
+        imp = dump_impact(hd["largest"], mk.get("mcap"), mk.get("liq"))
+        return f"biggest wallet owns {hd['largest']:.0f}%" + (f"; selling it all could drop price ~{imp:.0f}%" if imp else "")
+    if mk.get("ch_h1", 0) > 60:
+        return f"up {mk['ch_h1']:.0f}% in an hour; pullbacks are common"
+    return "liquidity could be pulled or buyers could fade"
+
+
 def fmt_best_item(i, a):
+    """Short /best card: one idea per line, plain words."""
     mk, hd, tf = a["market"], a["holders"], a["trades"]
     e = esc
-    L = [f"{verdict_icon(a['verdict'])} <b>#{i} ${e(mk['symbol'])}</b> {e(mk['name'][:30])} · <b>{a['score']}/100</b>",
+    pro, con = short_reasons(a)
+    sv = SHORT_VERDICT[a["verdict"]]
+    L = [f"{verdict_icon(a['verdict'])} <b>#{i} ${e(mk['symbol'])}</b> · <b>{a['score']}/100</b> · {sv}",
          f"<code>{e(a['mint'])}</code>",
-         f"MC {usd(mk['mcap'])} · Liq {usd(mk['liq'])} · Price {px(mk['price'])}",
-         f"5m {pct(mk['ch_m5'])} · 1h {pct(mk['ch_h1'])} · 24h {pct(mk['ch_h24'])}"
-         + (f" · 15m {pct(mk['ch_m15'])}" if mk.get("ch_m15") is not None else ""),
-         f"Vol 5m {usd(mk['vol_m5'])} · 1h {usd(mk['vol_h1'])} · 24h {usd(mk['vol_h24'])}",
-         f"Buys/sells 5m {mk['b5']}/{mk['s5']} · 1h {mk['b1']}/{mk['s1']}"
-         + (f" · {tf['unique_buyers']} buyers / {tf['unique_sellers']} sellers (last {tf['n']} trades)" if tf else "")]
+         f"💰 MC {usd(mk['mcap'])} · Liq {usd(mk['liq'])} · 1h {mk['ch_h1']:+.0f}% · 24h {mk['ch_h24']:+.0f}%",
+         f"📊 1h: {mk['b1']} buys / {mk['s1']} sells · volume {usd(mk['vol_h1'])}"]
     if hd:
-        L.append(f"Holders {hd['total'] or '?'} · top10 {hd['top10']:.1f}% · largest {hd['largest']:.1f}%"
-                 + (f" · dev {hd['dev_pct']:.1f}%" if hd["dev_pct"] is not None else ""))
-        L.append(f"Clusters (RugCheck graph, Bubblemaps-style): " + (
-            f"{len(hd['networks'])} linked groups hold {hd['cluster_pct']:.1f}%" if hd["networks"] else "none detected")
-                 + f" · insiders {hd['insider_pct']:.1f}%")
+        L.append(f"👥 {kfmt(hd['total'])} holders · top 10 own {hd['top10']:.0f}%"
+                 + (f" · dev {hd['dev_pct']:.0f}%" if hd["dev_pct"] is not None else ""))
+    if a["risk"] is not None:
+        L.append(f"🛡 Rug risk {a['risk']}/100: {RISK_WORD.get(a['risk_band'], a['risk_band'].lower())}")
     else:
-        L.append("Holders/clusters: RugCheck unavailable")
-    L.append("Thesis: unavailable (no public API) · " + social_line(mk))
-    L.append(f"Security: {a['risk_band']}" + (f" (risk {a['risk']}/100)" if a["risk"] is not None else ""))
-    L.append(f"Scored on {a['coverage']:.0%} of the weights · " + " · ".join(
-        f"{k[:4]} {v:.0f}" for k, v in a["cats"].items() if v is not None))
-    L.append("➕ " + e("; ".join(a["positives"][:3]) or "nothing stands out"))
-    L.append("➖ " + e("; ".join(a["negatives"][:3]) or "no major negatives found"))
-    L.append(f"📈 {e(a['scenarios']['bull'])}\n📉 {e(a['scenarios']['bear'])}")
-    L.append(f"<b>{a['verdict']}</b>")
-    L.append(src_line(a))
+        L.append("🛡 Safety: couldn't check (data source down)")
+    if pro:
+        L.append("✅ " + ", ".join(pro[:3]))
+    if con:
+        L.append("➖ " + ", ".join(con[:3]))
+    L.append("⚠️ " + e(biggest_risk(a)))
+    down = [k for k, v in a["src"].items() if not v["ok"]]
+    stale = (a["t"] - (a["src"].get("DexScreener") or {}).get("fetched", a["t"])) > 120
+    L.append(f"🕐 Checked {hm(a['t'])}" + (" · ⚠️ prices not fresh" if stale else "")
+             + (f" · missing: {', '.join(down)}" if down else ""))
     return "\n".join(L)
 
 
